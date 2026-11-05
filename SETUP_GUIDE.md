@@ -52,7 +52,7 @@ Vercel: Project -> Settings -> Environment Variables (set for **Production and P
 | `EMAIL_TEST_OVERRIDE_RECIPIENT` | no | While testing live email: redirect all mail to this address |
 | `GEMINI_API_KEY` | no | Enables invoice auto-fill |
 
-The server refuses to start, naming the problem, if a required variable is missing or malformed.
+If a required variable is missing or malformed, every page and API answers `503` with a message naming it (and the log shows it at startup).
 Never set `TEST_DATABASE_URL` to a real database (the serial-number tests write to it).
 
 ## 5. Configure the organisation (no code edits)
@@ -142,7 +142,7 @@ Deploy to a Vercel **Preview** first when possible.
 
 | Symptom | Likely cause |
 |---|---|
-| Server returns an error naming environment variables | A required variable is missing or too short; fix in Vercel and redeploy |
+| Site shows "This deployment is not configured yet" (503) | A required environment variable is missing or malformed; the message names it. Fix in Vercel and redeploy |
 | "Invalid config/org.config.ts" at startup | A config value is invalid; the message lists each one |
 | Login fails after `db:seed` | Passwords are shown once; delete the user row or re-seed a fresh database |
 | Uploads fail | `BLOB_READ_WRITE_TOKEN` missing, or the store is not Private |

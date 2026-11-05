@@ -55,9 +55,9 @@ Edge-compatible either.
 ## Environment variables
 
 Copy `.env.example` to `.env.local` and fill in real values. Never commit
-`.env.local` (already gitignored). The server checks these when it starts
-(`instrumentation.ts` -> `lib/env.ts`) and refuses to start, naming every
-missing or malformed required variable. Organisation settings are not
+`.env.local` (already gitignored). The server checks these on every request
+(`proxy.ts` -> `lib/env.ts`, and at startup in `instrumentation.ts`): if a required
+variable is missing or malformed, every page and API answers `503` naming each one. Organisation settings are not
 environment variables: see `config/org.config.ts` above.
 
 | Variable | Required | Description |
