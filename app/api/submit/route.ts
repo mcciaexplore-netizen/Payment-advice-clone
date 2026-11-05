@@ -1,0 +1,394 @@
+import { NextRequest, NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
+import { del } from "@vercel/blob";
+import { eq } from "drizzle-orm";
+import { db } from "@/lib/db";
+import {
+  paymentAdvices,
+  attachments,
+  auditLog,
+  cashVoucherItems,
+  advanceParticulars,
+  recommendingAuthorities,
+  vendorRequests,
+} from "@/lib/db/schema";
+import { notifyAuthorityApproval, notifySubmissionConfirmation } from "@/lib/email/notify";
+import { generateAuthorityToken } from "@/lib/advice/authority-token";
+import { displayNoFor, documentLabelFor } from "@/lib/advice/document-identity";
+import {
+  allocateAdvanceNumber,
+  allocateCashVoucherNumber,
+  allocateSerialNumber,
+  financialYearFor,
+} from "@/lib/serial";
+import { parsePaymentAdviceFormData } from "@/lib/form-data";
+import {
+  paymentAdviceFormSchema,
+} from "@/lib/validation/payment-advice";
+import {
+  groupUploadedAttachments,
+  parseUploadedAttachments,
+  validateAttachmentCounts,
+} from "@/lib/attachments/client-upload";
+import { verifyUploadedAttachments } from "@/lib/attachments/verify-uploaded";
+import { validateCashVoucherBillUploads } from "@/lib/attachments/cash-voucher-bills";
+import { isActiveVendor } from "@/lib/advice/vendor-check";
+import { captureVendorBankAccount } from "@/lib/advice/vendor-bank-accounts";
+import { todayInIst } from "@/lib/date-time";
+import { DEPARTMENT_NAME } from "@/lib/branding";
+import { moduleDisabledResponse, paymentAdviceModuleFor } from "@/lib/modules";
+
+export const runtime = "nodejs";
+
+function clientIp(req: NextRequest): string | null {
+  return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? null;
+}
+
+export async function POST(req: NextRequest) {
+  const formData = await req.formData();
+
+  const parsed = paymentAdviceFormSchema.safeParse(parsePaymentAdviceFormData(formData));
+
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: parsed.error.issues[0]?.message ?? "Invalid form data" },
+      { status: 400 },
+    );
+  }
+  const values = parsed.data;
+  const moduleOff = moduleDisabledResponse(paymentAdviceModuleFor(values.paymentMode, values.isAdvance));
+  if (moduleOff) return moduleOff;
+
+  // Zod only checked vendorId is a UUID-shaped string; confirm it's an
+  // actual, currently-active vendor before writing anything — closes the
+  // direct-API-bypass path where a caller skips the typeahead entirely and
+  // posts an arbitrary or stale id. Skipped when isNewVendorRequest is set:
+  // vendorId is deliberately null there, pending Finance's review.
+  if (
+    values.paymentMode === "NEFT" &&
+    !values.isAdvance &&
+    !values.isNewVendorRequest &&
+    !(await isActiveVendor(values.vendorId!))
+  ) {
+    return NextResponse.json(
+      { error: "Select a vendor from the list - free-text payee names are no longer accepted" },
+      { status: 400 },
+    );
+  }
+
+  const attachmentResult = parseUploadedAttachments(formData.get("uploadedAttachments"));
+  if ("error" in attachmentResult) {
+    return NextResponse.json({ error: attachmentResult.error }, { status: 400 });
+  }
+  const attachmentInputs = attachmentResult.attachments;
+  const byDocType = groupUploadedAttachments(attachmentInputs);
+  const countError = validateAttachmentCounts(byDocType, values.isAdvance, undefined, values.paymentMode);
+  if (countError) return NextResponse.json({ error: countError }, { status: 400 });
+  const cashBillError = values.paymentMode === "CASH" && !values.isAdvance
+    ? validateCashVoucherBillUploads(values.cashVoucherItems, attachmentInputs)
+    : null;
+  if (cashBillError) return NextResponse.json({ error: cashBillError }, { status: 400 });
+  const verificationError = await verifyUploadedAttachments(attachmentInputs, true);
+  if (verificationError) return NextResponse.json({ error: verificationError }, { status: 400 });
+
+  // Vendor request's own optional MSME document - same Blob verification as
+  // every other attachment, just not part of the shared attachments table.
+  const vendorRequestMsmeDocument =
+    values.isNewVendorRequest &&
+    values.vendorRequestMsmeDocumentUrl &&
+    values.vendorRequestMsmeDocumentPathname &&
+    values.vendorRequestMsmeDocumentFileName &&
+    values.vendorRequestMsmeDocumentSizeBytes
+      ? {
+          fileName: values.vendorRequestMsmeDocumentFileName,
+          blobPathname: values.vendorRequestMsmeDocumentPathname,
+          blobUrl: values.vendorRequestMsmeDocumentUrl,
+          sizeBytes: values.vendorRequestMsmeDocumentSizeBytes,
+        }
+      : null;
+  if (vendorRequestMsmeDocument) {
+    const msmeVerificationError = await verifyUploadedAttachments([vendorRequestMsmeDocument], true);
+    if (msmeVerificationError) return NextResponse.json({ error: msmeVerificationError }, { status: 400 });
+  }
+
+  const now = new Date();
+  // Never trust an editable/tampered client value for this system-owned
+  // business date. All three submission types use today's calendar date in
+  // India, matching the read-only field shown by the shared form.
+  const formDate = todayInIst(now);
+  let serialNo = "";
+  let financialYear = "";
+  let cashVoucherNo: string | null = null;
+  let advanceNo: string | null = null;
+  let billNo = values.billNo ?? "";
+
+  const uploadedPathnames = attachmentInputs.map((attachment) => attachment.blobPathname);
+  if (vendorRequestMsmeDocument) uploadedPathnames.push(vendorRequestMsmeDocument.blobPathname);
+  try {
+    const attachmentRecords = attachmentInputs.map((attachment) => ({
+      ...attachment,
+      id: randomUUID(),
+    }));
+    const cashBillAttachmentIds = new Map(
+      attachmentRecords
+        .filter((attachment) => attachment.docType === "CASH_VOUCHER_BILL")
+        .map((attachment) => [attachment.cashVoucherItemKey!, attachment.id]),
+    );
+
+    const { token: authorityToken, expiresAt: authorityTokenExpiresAt } = generateAuthorityToken();
+
+    const adviceId = await db.transaction(async (tx) => {
+      financialYear = financialYearFor(now);
+      if (values.isAdvance) {
+        advanceNo = await allocateAdvanceNumber(tx, financialYear);
+        serialNo = advanceNo;
+      } else if (values.paymentMode === "CASH") {
+        cashVoucherNo = await allocateCashVoucherNumber(tx, financialYear);
+        serialNo = cashVoucherNo;
+      } else {
+        ({ serialNo } = await allocateSerialNumber(tx, now));
+      }
+
+      // Allocation and row creation deliberately share this transaction. If
+      // any insert below fails, the counter rolls back with the submission.
+      billNo = values.isAdvance
+        ? (values.billNo ?? advanceNo ?? serialNo)
+        : values.paymentMode === "CASH"
+          ? (values.billNo ?? "")
+          : values.billNo!;
+      const billDate = values.isAdvance || values.paymentMode === "CASH" ? (values.billDate ?? formDate) : values.billDate!;
+
+      const [advice] = await tx
+        .insert(paymentAdvices)
+        .values({
+          serialNo,
+          financialYear,
+          cashVoucherNo,
+          isAdvance: values.isAdvance,
+          advanceNo,
+          purposeOfAdvance: values.isAdvance ? values.purposeOfAdvance ?? null : null,
+          previousPendingAdvanceAmount: values.isAdvance
+            ? values.previousPendingAdvanceAmount.toFixed(2)
+            : null,
+          previousPendingAdvanceSince: values.isAdvance
+            ? values.previousPendingAdvanceSince ?? null
+            : null,
+          status: "SUBMITTED",
+          authorityToken,
+          authorityTokenExpiresAt,
+          formDate,
+          vendorId: values.vendorId ?? null,
+          payeeName: values.payeeName,
+          payeeAddress: values.payeeAddress ?? "",
+          payeeEmail: values.payeeEmail ?? null,
+          payeeContactPerson: values.payeeContactPerson ?? null,
+          payeeContactPhone: values.payeeContactPhone ?? null,
+          payeeGstin: values.payeeGstin ?? null,
+          payeeUdyamNumber: values.payeeUdyamNumber ?? null,
+          poNumber: values.poNumber ?? null,
+          poDate: values.poDate ?? null,
+          deliveryChallanNo: values.deliveryChallanNo ?? null,
+          deliveryChallanDate: values.deliveryChallanDate ?? null,
+          billNo,
+          billDate,
+          amount: values.amount.toFixed(2),
+          basicAmount:
+            values.paymentMode === "NEFT" && !values.isAdvance
+              ? values.basicAmount!.toFixed(2)
+              : null,
+          gstAmount:
+            values.paymentMode === "NEFT" && !values.isAdvance
+              ? values.gstAmount!.toFixed(2)
+              : null,
+          // Mirrored into this NOT NULL column so every existing reader
+          // (PDF, Excel, authority-approval email) keeps working unchanged
+          // — same dual-representation pattern cash_voucher_items uses.
+          natureOfExpenditure: values.isAdvance
+            ? values.purposeOfAdvance ?? ""
+            : values.paymentMode === "CASH"
+              ? values.cashVoucherItems.map((item) => item.description).join("; ")
+              : values.natureOfExpenditure ?? "",
+          enclosures: values.enclosures ?? null,
+          specialRemarks: values.specialRemarks ?? null,
+          paymentMode: values.paymentMode,
+          bankAccountNo: values.bankAccountNo ?? null,
+          bankIfsc: values.bankIfsc ?? null,
+          beneficiaryName: values.beneficiaryName ?? null,
+          bankName: values.bankName ?? null,
+          bankDetailsMismatch: values.bankDetailsMismatch,
+          submittedByName: values.submittedByName,
+          submittedByEmail: values.submittedByEmail,
+          submittedByDepartment: values.submittedByDepartment,
+          branch: values.branch,
+          recommendingAuthorityId: values.recommendingAuthorityId,
+          submittedAt: now,
+        })
+        .returning();
+
+      if (values.paymentMode === "NEFT" && !values.isAdvance && !values.isNewVendorRequest) {
+        await captureVendorBankAccount(tx, {
+          vendorId: values.vendorId!,
+          bankAccountNo: values.bankAccountNo!,
+          bankIfsc: values.bankIfsc!,
+          beneficiaryName: values.beneficiaryName!,
+          sourceAdviceId: advice.id,
+          usedAt: now,
+        });
+      }
+
+      await tx.insert(attachments).values(
+        attachmentRecords.map((a) => ({
+          id: a.id,
+          paymentAdviceId: advice.id,
+          docType: a.docType,
+          fileName: a.fileName,
+          blobPathname: a.blobPathname,
+          blobUrl: a.blobUrl,
+          sizeBytes: a.sizeBytes,
+        })),
+      );
+
+      if (values.paymentMode === "CASH" && !values.isAdvance) {
+        await tx.insert(cashVoucherItems).values(
+          values.cashVoucherItems.map((item, sortOrder) => ({
+            paymentAdviceId: advice.id,
+            billNo: item.billNo ?? null,
+            billDate: item.billDate ?? null,
+            attachmentId: cashBillAttachmentIds.get(item.clientKey)!,
+            description: item.description,
+            amount: item.amount.toFixed(2),
+            sortOrder,
+          })),
+        );
+      }
+
+      if (values.isAdvance) {
+        await tx.insert(advanceParticulars).values(
+          values.advanceParticulars.map((item, sortOrder) => ({
+            paymentAdviceId: advice.id,
+            description: item.description,
+            amount: item.amount.toFixed(2),
+            sortOrder,
+          })),
+        );
+      }
+
+      await tx.insert(auditLog).values({
+        paymentAdviceId: advice.id,
+        action: "SUBMITTED",
+        actor: values.submittedByName,
+        ipAddress: clientIp(req),
+        details: { serialNo },
+      });
+
+      if (values.isNewVendorRequest) {
+        // vendor_requests.payment_advice_id is NOT NULL, so this row can
+        // only be created after the advice row above exists; the advice's
+        // own pending_vendor_request_id is then backfilled in a second
+        // update, same circular-FK ordering the schema was built for.
+        const [request] = await tx
+          .insert(vendorRequests)
+          .values({
+            requestedName: values.payeeName,
+            requestedAddress: values.payeeAddress ?? "",
+            requestedGstin: values.payeeGstin ?? null,
+            requestedVendorEmail: values.vendorRequestVendorEmail!,
+            msmeStatus: values.vendorRequestMsmeStatus,
+            msmeDocumentUrl: vendorRequestMsmeDocument?.blobUrl ?? null,
+            msmeDocumentType: values.vendorRequestMsmeDocumentType ?? null,
+            requestedByName: values.submittedByName,
+            requestedByEmail: values.submittedByEmail,
+            paymentAdviceId: advice.id,
+            msmeEmailSentAt: values.vendorRequestMsmeEmailSentAt
+              ? new Date(values.vendorRequestMsmeEmailSentAt)
+              : null,
+            msmeEmailMessageId: values.vendorRequestMsmeEmailMessageId ?? null,
+          })
+          .returning({ id: vendorRequests.id });
+
+        await tx
+          .update(paymentAdvices)
+          .set({ pendingVendorRequestId: request.id })
+          .where(eq(paymentAdvices.id, advice.id));
+
+        await tx.insert(auditLog).values({
+          paymentAdviceId: advice.id,
+          vendorRequestId: request.id,
+          action: "VENDOR_REQUEST_SUBMITTED",
+          actor: values.submittedByName,
+          ipAddress: clientIp(req),
+          details: { requestedName: values.payeeName },
+        });
+      }
+
+      return advice.id;
+    });
+
+    const [authority] = await db
+      .select({ authorityName: recommendingAuthorities.authorityName, email: recommendingAuthorities.email })
+      .from(recommendingAuthorities)
+      .where(eq(recommendingAuthorities.id, values.recommendingAuthorityId))
+      .limit(1);
+    const origin = new URL(req.url).origin;
+    const authorityName = authority?.authorityName ?? DEPARTMENT_NAME;
+    const displayNo = displayNoFor(values.paymentMode, serialNo, cashVoucherNo, values.isAdvance, advanceNo);
+    const documentLabel = documentLabelFor(values.paymentMode, values.isAdvance);
+    await notifySubmissionConfirmation(
+      {
+        displayNo,
+        documentLabel,
+        authorityName,
+        submittedByName: values.submittedByName,
+        payeeName: values.payeeName,
+        amount: values.amount.toLocaleString("en-IN", { minimumFractionDigits: 2 }),
+        paymentMode: values.paymentMode,
+        formDate,
+        paymentAdvicePdfLink:
+          values.paymentMode === "CASH" ? undefined : `${origin}/api/advice/${adviceId}/pdf`,
+        cashVoucherPdfLink:
+          values.paymentMode === "CASH"
+            ? `${origin}/api/advice/${adviceId}/cash-voucher-pdf`
+            : undefined,
+      },
+      values.submittedByEmail,
+      adviceId,
+    );
+    await notifyAuthorityApproval(
+      {
+        displayNo,
+        documentLabel,
+        authorityName,
+        submittedByName: values.submittedByName,
+        payeeName: values.payeeName,
+        amount: values.amount.toLocaleString("en-IN", { minimumFractionDigits: 2 }),
+        natureOfExpenditure: values.isAdvance
+          ? values.purposeOfAdvance ?? ""
+          : values.paymentMode === "CASH"
+            ? values.cashVoucherItems.map((item) => item.description).join("; ")
+            : values.natureOfExpenditure ?? "",
+        billReference: billNo,
+        paymentMode: values.paymentMode,
+        formDate,
+        approvalLink: `${origin}/authority-approval/${authorityToken}`,
+      },
+      authority?.email ?? null,
+      adviceId,
+    );
+
+    return NextResponse.json({
+      serialNo,
+      cashVoucherNo,
+      advanceNo,
+      id: adviceId,
+      authorityToken,
+      authorityName,
+    });
+  } catch (err) {
+    console.error("Submit failed after blob upload, cleaning up", err);
+    await Promise.allSettled(uploadedPathnames.map((p) => del(p)));
+    return NextResponse.json(
+      { error: "Something went wrong while saving your submission. Please try again." },
+      { status: 500 },
+    );
+  }
+}

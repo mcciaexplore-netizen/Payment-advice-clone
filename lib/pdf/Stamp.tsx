@@ -1,0 +1,95 @@
+import { THEME } from "@/lib/theme";
+import { StyleSheet, Text, View } from "@react-pdf/renderer";
+
+/**
+ * Digital "stamp" overlay for a signature-box footer cell — a clean bordered
+ * rectangle with a slight rotation for a stamped feel, not an attempt at
+ * rough ink-texture artwork (unreliable in a generated PDF). Renders name +
+ * date INSIDE the stamp itself, per the spec — never as separate text
+ * elsewhere in the cell. Solid brand colors, same box style across all
+ * three uses (Submitted/Recommended/Verified), only the accent color differs.
+ */
+export type StampColor = "navy" | "green" | "amber";
+
+const COLORS: Record<StampColor, { border: string; text: string }> = {
+  navy: { border: THEME.brand, text: THEME.brand },
+  green: { border: "#2E8B57", text: "#2E8B57" },
+  amber: { border: "#B8790C", text: "#B8790C" }, // darkened from the UI's #E8A33D for print legibility
+};
+
+const styles = StyleSheet.create({
+  wrapper: {
+    position: "absolute",
+    bottom: 7,
+    right: 6,
+  },
+  flowWrapper: {
+    alignSelf: "flex-end",
+    marginBottom: 7,
+  },
+  box: {
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderRadius: 4,
+    paddingVertical: 4,
+    paddingHorizontal: 6,
+    width: 94,
+    transform: "rotate(-5deg)",
+  },
+  // Forwarding Memo's inFlow layout sits directly in the signature block's
+  // normal document flow (not absolutely positioned in a corner like the
+  // other three uses), so the -5deg tilt is dropped there only - keeping it
+  // level is what makes it align cleanly with that block. The original
+  // Payment Advice/Cash Voucher stamps keep their tilt via `box` above,
+  // unchanged from before Forwarding Memo was added.
+  boxFlow: {
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderRadius: 4,
+    paddingVertical: 4,
+    paddingHorizontal: 6,
+    width: 94,
+  },
+  label: {
+    fontFamily: "Helvetica-Bold",
+    fontSize: 8,
+    letterSpacing: 0.55,
+    textAlign: "center",
+  },
+  name: {
+    fontFamily: "Helvetica-Bold",
+    fontSize: 7,
+    textAlign: "center",
+    marginTop: 2,
+  },
+  date: {
+    fontSize: 6.5,
+    textAlign: "center",
+    marginTop: 2,
+  },
+});
+
+export function Stamp({
+  label,
+  name,
+  date,
+  color,
+  inFlow = false,
+}: {
+  label: string;
+  name: string;
+  date: string;
+  color: StampColor;
+  inFlow?: boolean;
+}) {
+  const { border, text } = COLORS[color];
+  return (
+    <View style={inFlow ? styles.flowWrapper : styles.wrapper}>
+      <View style={[inFlow ? styles.boxFlow : styles.box, { borderColor: border }]}>
+        <Text style={[styles.label, { color: text }]}>{label}</Text>
+        <Text style={[styles.name, { color: text }]}>{name}</Text>
+        <Text style={[styles.date, { color: text }]}>{date}</Text>
+      </View>
+    </View>
+  );
+}

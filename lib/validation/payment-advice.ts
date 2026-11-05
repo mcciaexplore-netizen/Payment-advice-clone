@@ -1,0 +1,615 @@
+import { z } from "zod";
+import { todayInIst } from "@/lib/date-time";
+import { BRANCH_NAMES, HAS_DEPARTMENTS, ORG } from "@/lib/config";
+
+export const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
+const IFSC_RE = /^[A-Z]{4}0[A-Z0-9]{6}$/;
+const PHONE_RE = /^(\+91)?[6-9]\d{9}$/;
+
+/** Trims a string; converts blank strings to undefined so they store as NULL. */
+function optionalTrimmed() {
+  return z
+    .string()
+    .trim()
+    .transform((v) => (v === "" ? undefined : v))
+    .optional();
+}
+
+function requiredTrimmed(message: string) {
+  return z.string().trim().min(1, message);
+}
+
+/** YYYY-MM-DD date-only string, not in the future (compared to today). */
+function pastOrTodayDateString(message: string) {
+  return z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, "Enter a valid date")
+    .refine((v) => {
+      return v <= todayInIst();
+    }, message);
+}
+
+/** Same "trim/empty-to-undefined first, THEN validate format" ordering as
+ * optionalTrimmed's .pipe() uses for payeeContactPhone/payeeGstin/bankIfsc —
+ * validating the regex before the empty-string transform (as a single
+ * `.regex().transform()` chain would) fails on "", which matters a lot here:
+ * a date input that's conditionally hidden (e.g. Bill Date for an Advance
+ * Payment, or "Since" when Previous Pending Advance is 0) still gets
+ * registered with react-hook-form's native uncontrolled default of "" the
+ * moment it first mounts, and that stale "" is what's still sitting in form
+ * state if the field becomes inapplicable and unmounts before ever being
+ * touched — without this ordering, submission would fail validation with no
+ * visible error anywhere, since the field showing it is gone from the DOM. */
+function optionalDateString() {
+  return optionalTrimmed().pipe(
+    z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Enter a valid date").optional(),
+  );
+}
+
+/** Same reasoning as optionalDateString above, for a conditionally-hidden
+ * numeric field: react-hook-form's `valueAsNumber: true` turns an untouched,
+ * stale "" into NaN, which `z.number().optional()` does NOT forgive (only
+ * `undefined` satisfies `.optional()`) — so a hidden Basic/GST field that
+ * was briefly mounted before the user switched away from NEFT would
+ * otherwise block submission invisibly, the same way an unfixed
+ * optionalDateString would. */
+function optionalNumber(message: string) {
+  return z.preprocess(
+    (v) => (typeof v === "number" && Number.isNaN(v) ? undefined : v),
+    z.number().multipleOf(0.01, message).optional(),
+  );
+}
+
+/** Mirrors pastOrTodayDateString's future-date check, for fields that are
+ * only conditionally required (so can't use a Zod-level `.refine()` on the
+ * base schema — the check has to run inside superRefine instead). */
+function isFutureDateString(value: string): boolean {
+  return value > todayInIst();
+}
+
+export const DOC_TYPES = [
+  "TAX_INVOICE",
+  "APPROVAL_BUDGET",
+  "PURCHASE_ORDER",
+  "DELIVERY_CHALLAN",
+  "OTHER",
+  "CASH_VOUCHER_BILL",
+] as const;
+export const docTypeSchema = z.enum(DOC_TYPES);
+export type DocType = z.infer<typeof docTypeSchema>;
+
+export const paymentModeSchema = z.enum(["NEFT", "CASH"]);
+export type PaymentMode = z.infer<typeof paymentModeSchema>;
+
+export const statusSchema = z.enum(["SUBMITTED", "SENT_BACK", "REJECTED", "APPROVED"]);
+export const rejectSubmissionSchema = z.object({
+  remarks: z.string().trim().min(1, "Remarks are required"),
+});
+export type Status = z.infer<typeof statusSchema>;
+
+/**
+ * Finance Verification + Sanctioning pipeline (runs after Recommending
+ * Authority recommendation, for both NEFT and Cash).
+ *
+ * VERIFIER_NAMES / verifierNameSchema: retained ONLY for the still-existing
+ * `PATCH .../verify` correction route and its historical audit_log entries
+ * (see the project notes's "Real logins, retire Sanction" session) — Verify
+ * itself no longer uses a picker. Since real per-person Admin logins
+ * (admin_users), `verified_by` is auto-attributed from the logged-in
+ * user's full_name, which is not guaranteed to be one of these 4 names
+ * (e.g. the ALL-role account). Don't reuse this enum for new validation.
+ *
+ * SANCTIONER_NAMES / sanctionerNameSchema / sanctionSchema: Sanction is
+ * retired as an active step (see the project notes) — kept only because
+ * `POST/PATCH .../sanction` still exist for historical data, unreachable
+ * from the UI going forward.
+ */
+export const VERIFIER_NAMES = ORG.verifierNames as [string, ...string[]];
+export const verifierNameSchema = z.enum(VERIFIER_NAMES);
+export type VerifierName = z.infer<typeof verifierNameSchema>;
+
+export const SANCTIONER_NAMES = ORG.sanctionerNames as [string, ...string[]];
+export const sanctionerNameSchema = z.enum(SANCTIONER_NAMES);
+export type SanctionerName = z.infer<typeof sanctionerNameSchema>;
+
+export const sanctionSchema = z.object({
+  sanctionedBy: sanctionerNameSchema,
+  billPassedFor: z.number().positive("Bill passed for Rs. is required").optional(),
+});
+
+/** Body for correcting an already-recorded Verifier/Sanctioner name — never
+ * touches verifiedAt/sanctionedAt or (for sanction) billPassedFor, so these
+ * are deliberately narrower than verifySchema/sanctionSchema, not reused
+ * from them. */
+export const verifierNameCorrectionSchema = z.object({
+  verifiedBy: verifierNameSchema,
+});
+export const sanctionerNameCorrectionSchema = z.object({
+  sanctionedBy: sanctionerNameSchema,
+});
+
+/** Free-text description + amount line item — shared by Cash Voucher's
+ * "Nature of Expenditure" items and Advance Payment's "Particulars"
+ * breakdown (see the project notes: Particulars originally had its own
+ * preset-category-dropdown + "Other" shape, simplified to reuse this one
+ * directly rather than maintaining a parallel schema/total-calculation
+ * helper for a structurally identical line item). */
+const amountLineItemSchema = z.object({
+  description: requiredTrimmed("Nature of expenditure is required"),
+  amount: z
+    .number()
+    .positive("Each expenditure amount must be greater than 0")
+    .multipleOf(0.01, "Each expenditure amount can have at most 2 decimal places"),
+});
+
+export const cashVoucherItemSchema = amountLineItemSchema.extend({
+  // New rows have a registered hidden ID input whose browser value is "";
+  // historical/edit rows carry a real UUID. Normalize the new-row sentinel
+  // instead of rejecting an otherwise valid Cash Voucher before onSubmit.
+  id: z.union([z.literal("").transform(() => undefined), z.string().uuid()]).optional(),
+  clientKey: z.string().uuid(),
+  billNo: optionalTrimmed(),
+  billDate: optionalDateString(),
+});
+export type CashVoucherItem = z.infer<typeof cashVoucherItemSchema>;
+
+/** Branches and departments come from config/org.config.ts. */
+export const BRANCH_OPTIONS = BRANCH_NAMES;
+export const DEPARTMENT_OPTIONS = ORG.departments;
+
+// With no departments configured the department fields are hidden by the
+// forms and stored as "" - nothing to select, nothing to require.
+const departmentOptionField = (
+  HAS_DEPARTMENTS
+    ? z.enum(DEPARTMENT_OPTIONS as [string, ...string[]], { error: "Select your department" })
+    : z.string().default("")
+) as z.ZodType<string>;
+const departmentField = (
+  HAS_DEPARTMENTS ? requiredTrimmed("Enter your department") : z.string().trim().default("")
+) as z.ZodType<string>;
+
+/** Sums currency using paise to avoid floating-point drift. */
+export function calculateCashVoucherTotal(items: Array<{ amount: number }>): number {
+  return items.reduce((total, item) => total + Math.round(item.amount * 100), 0) / 100;
+}
+
+/**
+ * Fields the submitter fills in on the public form and the /edit/[token]
+ * resubmit form. Shared by the client (react-hook-form + zodResolver) and
+ * the server API route so validation can never drift between them.
+ */
+export const paymentAdviceFormSchema = z
+  .object({
+    // Section 1 — submitter
+    submittedByName: requiredTrimmed("Your name is required"),
+    submittedByEmail: z.string().trim().email("Enter a valid email"),
+    submittedByDepartmentOption: departmentOptionField,
+    submittedByDepartment: departmentField,
+    branch: z.enum(BRANCH_OPTIONS, { error: "Select your branch" }),
+    recommendingAuthorityId: z
+      .string()
+      .uuid("Select a recommending authority"),
+
+    // Section 2 — payee
+    vendorId: z.string().uuid().optional(),
+    // Set instead of vendorId when the submitter used "Can't find your
+    // vendor? Request to add them." - payeeName/payeeAddress/payeeGstin
+    // above are reused directly as the requested vendor's own name/address/
+    // GSTIN (same fields, same snapshot-onto-the-PA behavior as an existing
+    // vendor selection), so only the vendor-request-specific extras live
+    // here. See lib/advice/vendor-requests.ts.
+    isNewVendorRequest: z.boolean().default(false),
+    // Mandatory when isNewVendorRequest is true (enforced below in the
+    // superRefine, since it's optional at the object-shape level like every
+    // other vendor-request field) - 2026-10-01 revision: the app now sends
+    // the MSME request email itself rather than handing the submitter a
+    // mailto: link, so a real vendor email is required to send to, not
+    // just useful-on-record.
+    vendorRequestVendorEmail: optionalTrimmed().pipe(
+      z.string().email("Enter a valid vendor email").optional(),
+    ),
+    vendorRequestMsmeStatus: z
+      .enum(["MICRO", "SMALL", "MEDIUM", "NOT_REGISTERED", "UNKNOWN"])
+      .default("UNKNOWN"),
+    // Populated client-side only after a successful "Send Email" - carried
+    // through to the server exactly like the MSME document fields below, so
+    // the vendor_requests row created at PA submission already has them.
+    vendorRequestMsmeEmailSentAt: optionalTrimmed(),
+    vendorRequestMsmeEmailMessageId: optionalTrimmed(),
+    // Populated client-side only after the optional MSME document has
+    // already been uploaded direct-to-Blob (same pattern/route as every
+    // other attachment). Carries the raw blob reference through to the
+    // server - NOT yet verified at this point, same as uploadedAttachments
+    // elsewhere in this schema; the API route re-verifies pathname/url/size
+    // against Blob storage before trusting any of it (see verify-uploaded.ts).
+    vendorRequestMsmeDocumentUrl: optionalTrimmed().pipe(z.string().url().optional()),
+    vendorRequestMsmeDocumentPathname: optionalTrimmed(),
+    vendorRequestMsmeDocumentFileName: optionalTrimmed(),
+    vendorRequestMsmeDocumentSizeBytes: z.number().int().positive().optional(),
+    vendorRequestMsmeDocumentType: z.enum(["UDYAM_CERTIFICATE", "NON_MSME_DECLARATION"]).optional(),
+    payeeName: requiredTrimmed("Payee / company name is required"),
+    payeeAddress: optionalTrimmed(),
+    payeeContactPerson: optionalTrimmed(),
+    payeeContactPhone: optionalTrimmed().pipe(
+      z
+        .string()
+        .regex(PHONE_RE, "Enter a 10-digit phone, optionally +91-prefixed")
+        .optional(),
+    ),
+    payeeEmail: optionalTrimmed().pipe(
+      z.string().email("Enter a valid email").optional(),
+    ),
+    payeeGstin: optionalTrimmed().pipe(
+      z
+        .string()
+        .toUpperCase()
+        .regex(GSTIN_RE, "Enter a valid 15-character GSTIN")
+        .optional(),
+    ),
+    payeeUdyamNumber: optionalTrimmed(),
+
+    // Section 3 — bill & reference. Optional at the object-shape level since
+    // an Advance Payment has no bill yet (the whole section is hidden on the
+    // form for advances, mirroring why Tax Invoice isn't required either);
+    // required/validated for non-advance submissions specifically in the
+    // superRefine below.
+    billNo: optionalTrimmed(),
+    billDate: optionalDateString(),
+    poNumber: optionalTrimmed(),
+    poDate: optionalDateString(),
+    deliveryChallanNo: optionalTrimmed(),
+    deliveryChallanDate: optionalDateString(),
+    amount: z
+      .number()
+      .positive("Amount must be greater than 0")
+      .multipleOf(0.01, "Amount can have at most 2 decimal places"),
+    // Basic/GST split — NEFT only. Optional at the object-shape level since
+    // Cash never submits either; required/validated for NEFT specifically
+    // in the superRefine below (gstAmount may legitimately be 0, so it
+    // can't just be "truthy required").
+    basicAmount: optionalNumber("Basic Amount can have at most 2 decimal places"),
+    gstAmount: optionalNumber("GST Amount can have at most 2 decimal places"),
+    natureOfExpenditure: optionalTrimmed(),
+    cashVoucherItems: z.array(cashVoucherItemSchema).default([]),
+
+    // Advance Payment — a secondary flag layered on top of paymentMode, not
+    // a third paymentMode value (see the project notes). When true, the
+    // Basic/GST split, cashVoucherItems, and natureOfExpenditure inputs are
+    // all bypassed in favor of advanceParticulars + purposeOfAdvance below.
+    isAdvance: z.boolean().default(false),
+    purposeOfAdvance: optionalTrimmed(),
+    // Self-declared by the submitter, not system-verified (no Settlement
+    // tracking exists yet — explicitly out of scope). Defaults to 0;
+    // previousPendingAdvanceSince is only required when this is > 0.
+    previousPendingAdvanceAmount: z
+      .number()
+      .min(0, "Previous Pending Advance amount cannot be negative")
+      .default(0),
+    previousPendingAdvanceSince: optionalDateString(),
+    advanceParticulars: z.array(amountLineItemSchema).default([]),
+
+    // Section 4 — payment mode
+    paymentMode: paymentModeSchema,
+    bankAccountNo: optionalTrimmed(),
+    bankIfsc: optionalTrimmed().pipe(
+      z
+        .string()
+        .toUpperCase()
+        .regex(IFSC_RE, "Enter a valid IFSC code")
+        .optional(),
+    ),
+    beneficiaryName: optionalTrimmed(),
+    bankName: optionalTrimmed(),
+    // Set client-side only when Gemini invoice auto-fill detects the
+    // invoice's own printed bank details contradict the vendor's known
+    // system-of-record account (which always wins for what's actually
+    // saved above) — see lib/invoice-autofill.ts's bankDetailsMismatch().
+    bankDetailsMismatch: z.boolean().default(false),
+
+    // Section 5 — enclosures & remarks
+    enclosures: optionalTrimmed(),
+    specialRemarks: optionalTrimmed(),
+
+    // Header
+    formDate: pastOrTodayDateString("Form date cannot be in the future"),
+  })
+  .superRefine((data, ctx) => {
+    if (
+      HAS_DEPARTMENTS &&
+      data.submittedByDepartmentOption !== "OTHERS" &&
+      data.submittedByDepartment !== data.submittedByDepartmentOption
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["submittedByDepartmentOption"],
+        message: "Select your department",
+      });
+    }
+
+    // isNewVendorRequest isn't NEFT-specific (the "Request to add vendor"
+    // toggle is available for Cash Voucher too), so this check sits outside
+    // the NEFT-only block below — a vendor email is required to send the
+    // MSME request email to, regardless of payment mode.
+    if (data.isNewVendorRequest && !data.vendorRequestVendorEmail) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["vendorRequestVendorEmail"],
+        message: "Vendor email is required",
+      });
+    }
+
+    // Bank details are required for a regular NEFT submission, but NOT for
+    // an NEFT-routed advance — Finance already has the submitter's bank
+    // details on file as staff, and the fields stay visible/editable on the
+    // form in case they want to supply them anyway, just not required.
+    if (data.paymentMode === "NEFT" && !data.isAdvance) {
+      // A regular Payment Advice must name a real vendor selected from the
+      // list — free-text payee names are no longer accepted here (Advance
+      // Payment is unaffected: payee is always the submitter there, via a
+      // plain editable field, never this typeahead) — UNLESS the submitter
+      // used "Request to add" (isNewVendorRequest), the one other sanctioned
+      // way to name a payee not yet on the list. This only enforces
+      // presence; that a supplied vendorId actually belongs to a real,
+      // active vendor is checked server-side against the database, since
+      // Zod alone can't.
+      if (!data.vendorId && !data.isNewVendorRequest) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["payeeName"],
+          message: "Select a vendor from the list, or use \"Request to add\" if it's genuinely not there yet",
+        });
+      }
+      if (!data.enclosures) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["enclosures"],
+          message: "Enclosures are required",
+        });
+      }
+      if (!data.specialRemarks) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["specialRemarks"],
+          message: "Special Remarks are required",
+        });
+      }
+      if (!data.bankAccountNo) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["bankAccountNo"],
+          message: "Bank A/c No. is required for NEFT",
+        });
+      }
+      if (!data.bankIfsc) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["bankIfsc"],
+          message: "IFSC Code is required for NEFT",
+        });
+      }
+      if (!data.beneficiaryName) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["beneficiaryName"],
+          message: "Beneficiary Name is required for NEFT",
+        });
+      }
+      if (!data.bankName) {
+        ctx.addIssue({ code: "custom", path: ["bankName"], message: "Bank Name is required for NEFT" });
+      }
+    }
+
+    if (data.isAdvance) {
+      // Advance Payment — Particulars breakdown + Purpose replace the
+      // normal Basic/GST split (NEFT) / line items (Cash) + Nature of
+      // Expenditure entirely, regardless of which sub-route it's on.
+      if (!data.purposeOfAdvance) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["purposeOfAdvance"],
+          message: "Purpose of Advance is required",
+        });
+      }
+      if (data.advanceParticulars.length === 0) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["advanceParticulars"],
+          message: "Add at least one Particulars line item",
+        });
+      }
+      const computedTotal = calculateCashVoucherTotal(data.advanceParticulars);
+      if (computedTotal <= 0) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["advanceParticulars"],
+          message: "Particulars total must be greater than 0",
+        });
+      }
+      if (Math.round(data.amount * 100) !== Math.round(computedTotal * 100)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["amount"],
+          message: "Particulars total does not match the submitted amount",
+        });
+      }
+      if (data.previousPendingAdvanceAmount > 0 && !data.previousPendingAdvanceSince) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["previousPendingAdvanceSince"],
+          message: "\"Since\" date is required when a Previous Pending Advance amount is entered",
+        });
+      }
+    } else {
+      // Bill & Reference — required for every non-advance submission; an
+      // Advance Payment has no bill yet, so this whole section is hidden on
+      // the form and skipped entirely when isAdvance is true (see above).
+      if (data.paymentMode === "NEFT" && !data.billNo) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["billNo"],
+          message: "Bill number is required",
+        });
+      }
+      if (data.paymentMode === "NEFT" && !data.billDate) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["billDate"],
+          message: "Bill date is required",
+        });
+      } else if (data.billDate && isFutureDateString(data.billDate)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["billDate"],
+          message: "Bill date cannot be in the future",
+        });
+      }
+
+      if (data.paymentMode === "NEFT") {
+        if (!data.payeeAddress) {
+          ctx.addIssue({ code: "custom", path: ["payeeAddress"], message: "Payee address is required" });
+        }
+        if (!data.natureOfExpenditure) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["natureOfExpenditure"],
+            message: "Nature of expenditure is required",
+          });
+        }
+        if (data.basicAmount === undefined || data.basicAmount <= 0) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["basicAmount"],
+            message: "Basic Amount is required",
+          });
+        }
+        if (data.gstAmount === undefined) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["gstAmount"],
+            message: "GST Amount is required - enter 0 if GST is not applicable",
+          });
+        } else if (data.gstAmount < 0) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["gstAmount"],
+            message: "GST Amount cannot be negative",
+          });
+        }
+        if (data.basicAmount !== undefined && data.gstAmount !== undefined && data.gstAmount >= 0) {
+          const computedTotal =
+            (Math.round(data.basicAmount * 100) + Math.round(data.gstAmount * 100)) / 100;
+          if (Math.round(data.amount * 100) !== Math.round(computedTotal * 100)) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["amount"],
+              message: "Total does not match Basic Amount + GST Amount",
+            });
+          }
+        }
+      }
+      if (data.paymentMode === "CASH") {
+        if (data.cashVoucherItems.length === 0) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["cashVoucherItems"],
+            message: "Add at least one expenditure line item",
+          });
+        }
+        if (data.cashVoucherItems.length > 10) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["cashVoucherItems"],
+            message: "Maximum 10 expenses per submission",
+          });
+        }
+        data.cashVoucherItems.forEach((item, index) => {
+          if (item.billDate && isFutureDateString(item.billDate)) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["cashVoucherItems", index, "billDate"],
+              message: "Bill date cannot be in the future",
+            });
+          }
+        });
+        const computedTotal = calculateCashVoucherTotal(data.cashVoucherItems);
+        if (computedTotal <= 0) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["cashVoucherItems"],
+            message: "Cash voucher total must be greater than 0",
+          });
+        }
+        if (Math.round(data.amount * 100) !== Math.round(computedTotal * 100)) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["amount"],
+            message: "Cash voucher total does not match the submitted amount",
+          });
+        }
+      }
+    }
+  });
+
+export type PaymentAdviceFormInput = z.input<typeof paymentAdviceFormSchema>;
+export type PaymentAdviceFormValues = z.infer<typeof paymentAdviceFormSchema>;
+
+export const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+export const MAX_OTHER_ATTACHMENTS = 3;
+
+export const billPassedForSchema = (amount: number) =>
+  z
+    .number()
+    .positive("Bill passed for Rs. must be greater than 0")
+    .max(amount, "Bill passed for Rs. cannot exceed the billed amount");
+
+/**
+ * "Record a Payment" — NEFT only (see the project notes's multi-part payment
+ * model). The upper-bound cap (remaining = bill_passed_for - total_paid) is
+ * DB-dependent and enforced in the route itself, not here, same reasoning
+ * as billPassedForSchema needing `amount` passed in from outside.
+ */
+export const paymentEntrySchema = z.object({
+  amount: z
+    .number()
+    .positive("Payment amount must be greater than 0")
+    .multipleOf(0.01, "Payment amount can have at most 2 decimal places"),
+  remarks: optionalTrimmed(),
+});
+
+const tdsPercentSchema = z.union([
+  z.literal(0),
+  z.literal(1),
+  z.literal(2),
+  z.literal(5),
+  z.literal(10),
+  z.literal(31.2),
+]);
+
+export const payableCalculatorSchema = z.object({
+  arrearsAmount: z
+    .number()
+    .nonnegative("Arrears amount cannot be negative")
+    .multipleOf(0.01, "Arrears amount can have at most 2 decimal places")
+    .nullable()
+    .optional(),
+  currentTdsPercent: tdsPercentSchema,
+});
+
+export const gstSettlementSchema = z.object({ settled: z.literal(true) });
+
+export const sendBackSchema = z.object({
+  adminRemarks: requiredTrimmed("Remarks are required to send an entry back"),
+});
+
+export const authorityRejectSchema = z.object({
+  remarks: requiredTrimmed("Remarks are required to send this back to the submitter"),
+});
+
+export const authorityIdentityConfirmSchema = z.object({
+  email: z.string().trim().min(1, "Email is required").email("Enter a valid email address"),
+});
+
+export const approveSchema = z.object({
+  approvedByName: requiredTrimmed("Approving officer's name is required"),
+  billPassedFor: z.number().positive("Bill passed for Rs. is required"),
+});

@@ -1,0 +1,707 @@
+"use client";
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { Status } from "@/lib/validation/payment-advice";
+import { AdminRole } from "@/lib/auth";
+import { billPassedForLabelFor } from "@/lib/advice/document-identity";
+import { formatIstDate } from "@/lib/date-time";
+import { PayableCalculator } from "@/components/admin/PayableCalculator";
+import { GstSettlementTracker } from "@/components/admin/GstSettlementTracker";
+import { BackLink } from "@/components/admin/BackLink";
+import { ownsSubmissionType } from "@/lib/admin/role-scope";
+
+const ROLE_LABELS: Record<AdminRole, string> = {
+  PAYMENT_ADVICE: "a Payment Advice",
+  CASH_VOUCHER: "a Cash Voucher",
+  ALL: "an All-Access",
+  AUTHORITY: "an Authority",
+  BRANCH: "a Branch dashboard",
+  DEPARTMENT: "a Department dashboard",
+  SELF: "an individual My Submissions",
+  CASH_RECEIPT: "Cash Receipt",
+};
+
+export type PaymentEntryDisplay = {
+  id: string;
+  amount: string;
+  remarks: string;
+  paidAt: string;
+  paidBy: string;
+};
+
+function formatDateTime(iso: string): string {
+  return formatIstDate(iso);
+}
+
+function formatMoney(value: string | number): string {
+  return Number(value).toLocaleString("en-IN", { minimumFractionDigits: 2 });
+}
+
+/** Every past entry, date/amount/remarks/who — the audit trail Finance and
+ * anyone reviewing later needs. NEFT only; Cash never has any of these. */
+function PaymentEntriesList({ entries }: { entries: PaymentEntryDisplay[] }) {
+  if (entries.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="text-xs font-medium uppercase tracking-wide text-gray-500">Payment History</p>
+      <ul className="flex flex-col gap-2">
+        {entries.map((entry) => (
+          <li key={entry.id} className="rounded-md border border-gray-200 p-3 text-sm">
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="font-medium text-brand">₹ {formatMoney(entry.amount)}</span>
+              <span className="text-xs text-gray-500">
+                {formatDateTime(entry.paidAt)} · {entry.paidBy}
+              </span>
+            </div>
+            {entry.remarks ? <p className="mt-1 text-gray-600">{entry.remarks}</p> : null}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export function AdviceActions({
+  adviceId,
+  status,
+  initialBillPassedFor,
+  basicAmount,
+  gstAmount,
+  initialArrearsAmount,
+  initialCurrentTdsPercent,
+  initialPayableAmount,
+  initialEditToken,
+  paymentMode,
+  isAdvance,
+  authorityToken,
+  authorityName,
+  authorityApprovedAt,
+  authorityRejectedAt,
+  financeReceivedAt,
+  verifiedAt,
+  verifiedBy,
+  sanctionedAt,
+  sanctionedBy,
+  paymentDoneAt,
+  paymentDoneBy,
+  totalPaid,
+  paymentEntries,
+  gstSettled,
+  gstSettledBy,
+  gstSettledAt,
+  currentUserFullName,
+  currentUserRoles,
+}: {
+  adviceId: string;
+  status: Status;
+  initialBillPassedFor: string | null;
+  basicAmount: string | null;
+  gstAmount: string | null;
+  initialArrearsAmount: string | null;
+  initialCurrentTdsPercent: string | null;
+  initialPayableAmount: string | null;
+  initialEditToken: string | null;
+  paymentMode: "NEFT" | "CASH";
+  isAdvance: boolean;
+  authorityToken: string | null;
+  authorityName: string;
+  authorityApprovedAt: string | null;
+  authorityRejectedAt: string | null;
+  financeReceivedAt: string | null;
+  verifiedAt: string | null;
+  verifiedBy: string | null;
+  sanctionedAt: string | null;
+  sanctionedBy: string | null;
+  paymentDoneAt: string | null;
+  paymentDoneBy: string | null;
+  /** NEFT only — Cash never writes to total_paid, stays "0.00" forever. */
+  totalPaid: string;
+  /** NEFT only — Cash never has payment_entries rows. */
+  paymentEntries: PaymentEntryDisplay[];
+  gstSettled: boolean;
+  gstSettledBy: string | null;
+  gstSettledAt: string | null;
+  currentUserFullName: string;
+  currentUserRoles: AdminRole[];
+}) {
+  const router = useRouter();
+  // Retained only for regular Cash Voucher, whose existing one-shot payment
+  // flow is explicitly out of scope and remains unchanged.
+  const billPassedForLabel = billPassedForLabelFor(isAdvance);
+  const [authorityLinkCopied, setAuthorityLinkCopied] = useState(false);
+
+  function copyAuthorityLink() {
+    if (!authorityToken) return;
+    const url = `${window.location.origin}/authority-approval/${authorityToken}`;
+    navigator.clipboard.writeText(url);
+    setAuthorityLinkCopied(true);
+    setTimeout(() => setAuthorityLinkCopied(false), 2000);
+  }
+
+  const [billPassedFor, setBillPassedFor] = useState(initialBillPassedFor ?? "");
+  const [savingBillPassedFor, setSavingBillPassedFor] = useState(false);
+  const [billPassedForError, setBillPassedForError] = useState<string | null>(null);
+
+  const [receiving, setReceiving] = useState(false);
+  const [receiveError, setReceiveError] = useState<string | null>(null);
+
+  const [verifying, setVerifying] = useState(false);
+  const [verifyError, setVerifyError] = useState<string | null>(null);
+
+  // Cash only — the single one-shot terminal action, unchanged.
+  const [markingPaymentDone, setMarkingPaymentDone] = useState(false);
+  const [paymentDoneError, setPaymentDoneError] = useState<string | null>(null);
+
+  // NEFT only — "Record a Payment" (multi-part).
+  const [entryAmount, setEntryAmount] = useState("");
+  const [entryRemarks, setEntryRemarks] = useState("");
+  const [recordingPayment, setRecordingPayment] = useState(false);
+  const [recordPaymentError, setRecordPaymentError] = useState<string | null>(null);
+
+  const [showSendBack, setShowSendBack] = useState(false);
+  const [remarks, setRemarks] = useState("");
+  const [sendBackError, setSendBackError] = useState<string | null>(null);
+  const [sendingBack, setSendingBack] = useState(false);
+  const [showReject, setShowReject] = useState(false);
+  const [rejectionRemarks, setRejectionRemarks] = useState("");
+  const [rejectError, setRejectError] = useState<string | null>(null);
+  const [rejecting, setRejecting] = useState(false);
+
+  const [editToken, setEditToken] = useState(initialEditToken);
+  const [copied, setCopied] = useState(false);
+
+  const hasPaymentEntries = paymentMode === "NEFT" && paymentEntries.length > 0;
+  const canManagePayments = ownsSubmissionType(currentUserRoles, paymentMode);
+
+  async function saveBillPassedFor() {
+    setBillPassedForError(null);
+    setSavingBillPassedFor(true);
+    try {
+      const res = await fetch(`/api/admin/advice/${adviceId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ billPassedFor: Number(billPassedFor) }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setBillPassedForError(data.error ?? "Could not save.");
+        return;
+      }
+      router.refresh();
+    } finally {
+      setSavingBillPassedFor(false);
+    }
+  }
+
+  async function markReceived() {
+    setReceiveError(null);
+    setReceiving(true);
+    try {
+      const res = await fetch(`/api/admin/advice/${adviceId}/receive`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) {
+        setReceiveError(data.error ?? "Could not mark received.");
+        return;
+      }
+      router.refresh();
+    } finally {
+      setReceiving(false);
+    }
+  }
+
+  async function verify() {
+    setVerifyError(null);
+    setVerifying(true);
+    try {
+      const res = await fetch(`/api/admin/advice/${adviceId}/verify`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) {
+        setVerifyError(data.error ?? "Could not verify.");
+        return;
+      }
+      router.refresh();
+    } finally {
+      setVerifying(false);
+    }
+  }
+
+  // Cash only.
+  async function markPaymentDone() {
+    setPaymentDoneError(null);
+    setMarkingPaymentDone(true);
+    try {
+      const res = await fetch(`/api/admin/advice/${adviceId}/payment-done`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          billPassedFor: billPassedFor ? Number(billPassedFor) : undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setPaymentDoneError(data.error ?? "Could not mark Payment Done.");
+        return;
+      }
+      router.refresh();
+    } finally {
+      setMarkingPaymentDone(false);
+    }
+  }
+
+  // NEFT only.
+  async function recordPayment() {
+    setRecordPaymentError(null);
+    setRecordingPayment(true);
+    try {
+      const res = await fetch(`/api/admin/advice/${adviceId}/payment-entries`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          amount: Number(entryAmount),
+          remarks: entryRemarks,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setRecordPaymentError(data.error ?? "Could not record payment.");
+        return;
+      }
+      setEntryAmount("");
+      setEntryRemarks("");
+      router.refresh();
+    } finally {
+      setRecordingPayment(false);
+    }
+  }
+
+  async function sendBack() {
+    setSendBackError(null);
+    setSendingBack(true);
+    try {
+      const res = await fetch(`/api/admin/advice/${adviceId}/send-back`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ adminRemarks: remarks }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setSendBackError(data.error ?? "Could not send back.");
+        return;
+      }
+      setEditToken(data.editToken);
+      setShowSendBack(false);
+      router.refresh();
+    } finally {
+      setSendingBack(false);
+    }
+  }
+
+  async function rejectSubmission() {
+    setRejectError(null); setRejecting(true);
+    try {
+      const res = await fetch(`/api/admin/advice/${adviceId}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ remarks: rejectionRemarks }) });
+      const data = await res.json();
+      if (!res.ok) { setRejectError(data.error ?? "Could not reject this submission."); return; }
+      router.refresh();
+    } finally { setRejecting(false); }
+  }
+
+  function copyEditLink() {
+    if (!editToken) return;
+    const url = `${window.location.origin}/edit/${editToken}`;
+    navigator.clipboard.writeText(url);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+
+  if (status === "REJECTED") return (
+    <div className="flex flex-col gap-4">
+      <div className="rounded-md border border-red-400 bg-red-50 p-4 text-sm text-red-950">This submission is permanently rejected. Its reference number remains assigned and will not be reused.</div>
+      <BackLink
+        label="Back to Submissions"
+        fallbackHref="/admin/submissions"
+        className="w-fit rounded-md border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+      />
+    </div>
+  );
+
+  if (status === "APPROVED") {
+    if (paymentMode === "CASH" && !isAdvance) {
+      // Unchanged — Cash's single one-shot terminal action.
+      const doneAt = paymentDoneAt ?? sanctionedAt;
+      const doneBy = paymentDoneBy ?? sanctionedBy;
+      return (
+        <div className="flex flex-col gap-4">
+          <div className="flex flex-col gap-2 rounded-md border border-gray-200 p-4">
+            <p className="text-sm font-medium text-brand">
+              {billPassedForLabel} {initialBillPassedFor ?? "-"}
+            </p>
+            <p className="text-sm text-gray-600">
+              Payment Done{doneBy ? ` - ${doneBy}` : ""}
+              {doneAt
+                ? ` on ${formatIstDate(doneAt)}`
+                : ""}
+              .
+            </p>
+            <a
+              href={`/api/admin/advice/${adviceId}/cash-voucher-pdf`}
+              className="inline-block w-fit rounded-md bg-brand px-4 py-2 text-sm font-medium text-white hover:bg-brand/90"
+            >
+              Download Cash Payment Voucher
+            </a>
+          </div>
+          <BackLink
+            label="Back to Submissions"
+            fallbackHref="/admin/submissions"
+            className="w-fit rounded-md border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+          />
+        </div>
+      );
+    }
+
+  }
+
+  const remaining =
+    initialPayableAmount != null ? Number(initialPayableAmount) - Number(totalPaid) : null;
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-6 rounded-md border border-gray-200 p-4">
+      {paymentMode === "CASH" ? (
+        <a
+          href={`/api/advice/${adviceId}/cash-voucher-pdf`}
+          className="inline-block w-fit rounded-md border border-brand px-4 py-2 text-sm font-medium text-brand hover:bg-brand/5"
+        >
+          Preview Cash Payment Voucher (pre-approval)
+        </a>
+      ) : (
+        <a
+          href={`/api/advice/${adviceId}/pdf`}
+          className="inline-block w-fit rounded-md border border-brand px-4 py-2 text-sm font-medium text-brand hover:bg-brand/5"
+        >
+          Preview Payment Advice PDF (pre-approval, for signing)
+        </a>
+      )}
+
+      {paymentMode === "CASH" && !isAdvance ? <div className="flex flex-col gap-2">
+        <label className="text-sm font-medium text-brand">{billPassedForLabel}</label>
+        <div className="flex items-center gap-2">
+          <input
+            type="number"
+            step="0.01"
+            min="0.01"
+            value={billPassedFor}
+            onChange={(e) => setBillPassedFor(e.target.value)}
+            className="admin-filter-input w-40"
+          />
+          <button
+            type="button"
+            onClick={saveBillPassedFor}
+            disabled={savingBillPassedFor || !billPassedFor}
+            className="rounded-md border border-gray-300 px-3 py-1.5 text-sm hover:bg-gray-50 disabled:opacity-50"
+          >
+            {savingBillPassedFor ? "Saving…" : "Save"}
+          </button>
+        </div>
+        {billPassedForError ? (
+          <p className="text-sm font-medium text-[#b3261e]">{billPassedForError}</p>
+        ) : null}
+      </div> : null}
+
+      {editToken ? (
+        <div className="rounded-md bg-gray-50 p-3 text-sm">
+          <p className="mb-2 text-gray-700">
+            This entry was sent back{authorityRejectedAt ? ` by ${authorityName}` : ""}. Share
+            the edit link with the submitter.
+          </p>
+          <button
+            type="button"
+            onClick={copyEditLink}
+            className="rounded-md border border-gray-300 px-3 py-1.5 hover:bg-gray-100"
+          >
+            {copied ? "Copied!" : "Copy edit link"}
+          </button>
+        </div>
+      ) : null}
+
+      {authorityApprovedAt ? (
+        <div className="rounded-md border border-[#2e8b57]/30 bg-[#2e8b57]/5 p-3 text-sm text-[#1e5c39]">
+          Recommended by {authorityName} on{" "}
+          {formatIstDate(authorityApprovedAt)}
+          .
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2 rounded-md border border-[#e8a33d]/40 bg-[#e8a33d]/10 p-3 text-sm text-[#8a5a12]">
+          <p>
+            Waiting on <span className="font-medium">{authorityName}</span> (Recommending
+            Authority) to recommend before Finance can proceed.
+          </p>
+          {authorityToken ? (
+            <button
+              type="button"
+              onClick={copyAuthorityLink}
+              className="w-fit rounded-md border border-[#8a5a12]/30 px-3 py-1.5 hover:bg-[#e8a33d]/10"
+            >
+              {authorityLinkCopied ? "Copied!" : `Copy link to share with ${authorityName}`}
+            </button>
+          ) : null}
+        </div>
+      )}
+
+      {/* Finance pipeline — only one stage's action is ever actionable at a
+          time, gated in the same order the server enforces (received ->
+          verified -> Ready for Payment (automatic) -> Payment Done). */}
+      {authorityApprovedAt && !financeReceivedAt ? (
+        <div className="flex flex-col gap-2 rounded-md border border-[#e8a33d]/40 bg-[#e8a33d]/10 p-3 text-sm text-[#8a5a12]">
+          <p>Ready for Finance to receive this submission.</p>
+          {receiveError ? <p className="font-medium text-[#b3261e]">{receiveError}</p> : null}
+          <button
+            type="button"
+            onClick={markReceived}
+            disabled={receiving}
+            className="w-fit rounded-md bg-brand px-4 py-2 text-sm font-medium text-white hover:bg-brand/90 disabled:opacity-50"
+          >
+            {receiving ? "Marking…" : "Mark Received & In Process"}
+          </button>
+        </div>
+      ) : null}
+
+      {financeReceivedAt && !verifiedAt ? (
+        <div className="flex flex-col gap-3 rounded-md border border-[#e8a33d]/40 bg-[#e8a33d]/10 p-4 text-sm text-[#8a5a12]">
+          <p>
+            Will be recorded as verified by <span className="font-medium">{currentUserFullName}</span>.
+          </p>
+          {verifyError ? <p className="font-medium text-[#b3261e]">{verifyError}</p> : null}
+          <button
+            type="button"
+            onClick={verify}
+            disabled={verifying}
+            className="w-fit rounded-md bg-brand px-4 py-2 text-sm font-medium text-white hover:bg-brand/90 disabled:opacity-50"
+          >
+            {verifying ? "Verifying…" : "Confirm Verification"}
+          </button>
+        </div>
+      ) : null}
+
+      {verifiedAt ? (
+        <div className="rounded-md border border-[#2e8b57]/30 bg-[#2e8b57]/5 p-3 text-sm text-[#1e5c39]">
+          Verified by {verifiedBy} on{" "}
+          {formatIstDate(verifiedAt)}
+          .
+        </div>
+      ) : null}
+
+      {verifiedAt && (paymentMode === "NEFT" || isAdvance) ? (
+        <PayableCalculator
+          adviceId={adviceId}
+          basicAmount={basicAmount}
+          gstAmount={gstAmount}
+          isAdvance={isAdvance}
+          initialArrearsAmount={initialArrearsAmount}
+          initialCurrentTdsPercent={initialCurrentTdsPercent}
+          initialPayableAmount={initialPayableAmount}
+          locked={hasPaymentEntries || status === "APPROVED"}
+          canEdit={canManagePayments && status === "SUBMITTED"}
+        />
+      ) : null}
+
+      {verifiedAt && paymentMode === "NEFT" && !isAdvance && Number(gstAmount ?? 0) > 0 ? (
+        <GstSettlementTracker
+          adviceId={adviceId}
+          gstAmount={gstAmount ?? "0"}
+          gstSettled={gstSettled}
+          gstSettledBy={gstSettledBy}
+          gstSettledAt={gstSettledAt}
+          canEdit={canManagePayments && (status === "SUBMITTED" || status === "APPROVED")}
+        />
+      ) : null}
+
+      {/* "Ready for Payment" is automatic the moment verifiedAt is set — no
+          click required. Cash: unchanged single "Mark Payment Done" action.
+          NEFT: multi-part "Record a Payment" (see the project notes). */}
+      {verifiedAt && status === "SUBMITTED" && paymentMode === "CASH" && !paymentDoneAt ? (
+        <div className="flex flex-col gap-3 rounded-md border border-[#2e8b57]/30 bg-[#2e8b57]/5 p-4 text-sm">
+          <p className="font-medium text-[#1e5c39]">Ready for Payment.</p>
+          {ownsSubmissionType(currentUserRoles, paymentMode) ? (
+            <>
+              <p className="text-[#1e5c39]">
+                Will be recorded as paid by <span className="font-medium">{currentUserFullName}</span>.
+              </p>
+              {!(isAdvance ? initialPayableAmount : billPassedFor) ? (
+                <p className="text-xs text-gray-500">
+                  {isAdvance
+                    ? "The payable calculation above must be saved before marking Payment Done."
+                    : `“${billPassedForLabel}” above must be saved before marking Payment Done.`}
+                </p>
+              ) : null}
+              {paymentDoneError ? (
+                <p className="font-medium text-[#b3261e]">{paymentDoneError}</p>
+              ) : null}
+              <button
+                type="button"
+                onClick={markPaymentDone}
+                disabled={markingPaymentDone || !(isAdvance ? initialPayableAmount : billPassedFor)}
+                className="w-fit rounded-md bg-[#2e8b57] px-4 py-2 text-sm font-medium text-white hover:bg-[#2e8b57]/90 disabled:opacity-50"
+              >
+                {markingPaymentDone ? "Marking…" : "Mark Payment Done"}
+              </button>
+            </>
+          ) : (
+            <p className="text-xs text-gray-500">
+              Only {ROLE_LABELS[paymentMode === "CASH" ? "CASH_VOUCHER" : "PAYMENT_ADVICE"]} account
+              (or an All-Access account) can mark this Payment Done.
+            </p>
+          )}
+        </div>
+      ) : null}
+
+      {status === "APPROVED" && paymentMode === "CASH" && isAdvance ? (
+        <div className="rounded-md border border-[#2e8b57]/30 bg-[#2e8b57]/5 p-4 text-sm text-[#1e5c39]">
+          Payment Done{paymentDoneBy ? ` - ${paymentDoneBy}` : ""}
+          {paymentDoneAt ? ` on ${formatIstDate(paymentDoneAt)}` : ""}.
+        </div>
+      ) : null}
+
+      {verifiedAt && paymentMode === "NEFT" ? (
+        <div className="flex flex-col gap-4 rounded-md border border-[#2e8b57]/30 bg-[#2e8b57]/5 p-4 text-sm">
+          <div>
+            <p className="font-medium text-[#1e5c39]">
+              {status === "APPROVED"
+                ? "Fully Payment Settled."
+                : Number(totalPaid) > 0
+                  ? "Partial Payment Done."
+                  : "Ready for Payment."}
+            </p>
+            {/* Stored Basic and GST (same values as above; nothing recalculated).
+                Payments here are against the basic amount after TDS; GST is
+                settled separately on this page. */}
+            {basicAmount !== null || gstAmount !== null ? (
+              <p className="mt-1 text-[#1e5c39]">
+                Basic amount: ₹ {formatMoney(basicAmount ?? "0")} · GST amount: ₹ {formatMoney(gstAmount ?? "0")}
+                {initialPayableAmount ? <> · Payable: ₹ {formatMoney(initialPayableAmount)}</> : null}
+              </p>
+            ) : null}
+            {remaining !== null ? (
+              <p className="mt-1 text-[#1e5c39]">
+                Paid so far: ₹ {formatMoney(totalPaid)} of ₹ {formatMoney(initialPayableAmount ?? "0")}{" "}
+                - ₹ {formatMoney(remaining)} remaining.
+              </p>
+            ) : null}
+          </div>
+
+          <PaymentEntriesList entries={paymentEntries} />
+
+          {status === "SUBMITTED" && canManagePayments ? (
+            !initialPayableAmount ? (
+              <p className="text-xs font-medium text-amber-800">
+                Payable amount not set. Save the payable calculation above before recording a payment.
+              </p>
+            ) : (
+              <div className="flex flex-col gap-2 rounded-md border border-[#2e8b57]/30 bg-white p-3">
+                <p className="text-xs font-medium uppercase tracking-wide text-gray-500">
+                  Record a Payment
+                </p>
+                <label className="text-sm font-medium text-brand">
+                  Amount (Rs.)
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0.01"
+                    max={remaining ?? undefined}
+                    value={entryAmount}
+                    onChange={(e) => setEntryAmount(e.target.value)}
+                    className="admin-filter-input mt-1 w-full"
+                  />
+                </label>
+                <label className="text-sm font-medium text-brand">
+                  Remarks <span className="text-xs font-normal text-gray-500">Optional</span>
+                  <textarea
+                    value={entryRemarks}
+                    onChange={(e) => setEntryRemarks(e.target.value)}
+                    rows={2}
+                    className="admin-filter-input mt-1 w-full"
+                  />
+                </label>
+                {recordPaymentError ? (
+                  <p className="text-sm font-medium text-[#b3261e]">{recordPaymentError}</p>
+                ) : null}
+                <p className="text-xs text-gray-500">
+                  Will be recorded as paid by <span className="font-medium">{currentUserFullName}</span>.
+                </p>
+                <button
+                  type="button"
+                  onClick={recordPayment}
+                  disabled={recordingPayment || !entryAmount}
+                  className="w-fit rounded-md bg-[#2e8b57] px-4 py-2 text-sm font-medium text-white hover:bg-[#2e8b57]/90 disabled:opacity-50"
+                >
+                  {recordingPayment ? "Recording…" : "Record Payment"}
+                </button>
+              </div>
+            )
+          ) : status === "SUBMITTED" ? (
+            <p className="text-xs text-gray-500">
+              Only {ROLE_LABELS.PAYMENT_ADVICE} account (or an All-Access account) can record a
+              payment.
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+
+      {status !== "APPROVED" ? <div className="flex gap-3">
+        {hasPaymentEntries ? (
+          <p className="text-xs text-gray-500">
+            Send Back is unavailable once a payment has been recorded against this advice.
+          </p>
+        ) : (
+          <><button
+            type="button"
+            onClick={() => setShowSendBack((v) => !v)}
+            className="rounded-md border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+          >
+            Send Back
+          </button><button type="button" onClick={() => setShowReject((v) => !v)} className="rounded-md border border-red-500 px-4 py-2 text-sm font-medium text-red-950 hover:bg-red-50">Reject</button></>
+        )}
+      </div> : null}
+
+      {showSendBack && !hasPaymentEntries ? (
+        <div className="flex flex-col gap-3 rounded-md border border-gray-300 bg-gray-50 p-4">
+          <label className="text-sm font-medium text-brand">
+            Remarks for Submitter <span className="text-xs font-normal text-[#b3261e]">Required</span>
+          </label>
+          <textarea
+            value={remarks}
+            onChange={(e) => setRemarks(e.target.value)}
+            rows={3}
+            className="admin-filter-input"
+          />
+          {sendBackError ? <p className="text-sm font-medium text-[#b3261e]">{sendBackError}</p> : null}
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={sendBack}
+              disabled={sendingBack || !remarks.trim()}
+              className="rounded-md bg-brand px-4 py-2 text-sm font-medium text-white hover:bg-brand/90 disabled:opacity-50"
+            >
+              {sendingBack ? "Sending…" : "Confirm Send Back"}
+            </button>
+          </div>
+        </div>
+      ) : null}
+      {showReject && !hasPaymentEntries ? <div className="flex flex-col gap-3 rounded-md border border-red-400 bg-red-50 p-4"><p className="text-sm text-red-950">Permanently close this submission. The reference number will not be reused.</p><label className="text-sm font-medium text-red-950">Rejection remarks <span className="text-xs font-normal text-[#b3261e]">Required</span></label><textarea value={rejectionRemarks} onChange={(e) => setRejectionRemarks(e.target.value)} rows={3} className="admin-filter-input"/>{rejectError ? <p className="text-sm font-medium text-[#b3261e]">{rejectError}</p> : null}<button type="button" onClick={rejectSubmission} disabled={rejecting || !rejectionRemarks.trim()} className="w-fit rounded-md bg-red-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50">{rejecting ? "Rejecting…" : "Confirm Reject"}</button></div> : null}
+      </div>
+
+      {/* Second shortcut back to the list, below the whole action panel
+          above (Send Back/Reject included), outside its border - a long
+          detail page otherwise leaves only the top-of-page link, out of
+          view once scrolled down here. Shares BackLink's exact
+          history-back-with-fallback behavior, so this and the top link
+          always land in the same place. */}
+      <BackLink
+        label="Back to Submissions"
+        fallbackHref="/admin/submissions"
+        className="w-fit rounded-md border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+      />
+    </div>
+  );
+}

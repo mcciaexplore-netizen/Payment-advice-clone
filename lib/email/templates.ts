@@ -1,0 +1,367 @@
+import { formatDateOnly } from "@/lib/date-time";
+import { APP_NAME, ORG_ADDRESS_LINE_1, ORG_ADDRESS_LINE_2, ORG_NAME } from "@/lib/branding";
+import { THEME } from "@/lib/theme";
+
+/** Escapes every dynamic value before it is interpolated into email HTML. */
+function escapeHtml(value: string | number): string {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function replaceTokens(template: string, values: Record<string, string | number | undefined>): string {
+  return Object.entries(values).reduce(
+    (html, [token, value]) => html.replaceAll(`{{${token}}}`, escapeHtml(value ?? "")),
+    template,
+  );
+}
+
+// Referenced as a CID (Content-ID) inline attachment, not hotlinked over
+// HTTPS - the hotlink (first a third-party website URL, then this
+// app's own /logo.png) kept
+// rendering as a broken image in real inboxes (Outlook and others block
+// externally-fetched images by default for unfamiliar senders, showing a
+// broken-icon placeholder instead). A `cid:` reference needs no network
+// fetch at all - the bytes travel with the email as a real MIME
+// attachment - so there is nothing for that image-blocking behavior to
+// block. notify.ts's dispatch() attaches public/logo.png under this
+// exact CID on every email it sends, regardless of template. Real
+// width/height (1085x258) preserved at this same ~4.2:1 ratio to avoid
+// distortion.
+export const LOGO_CID = "org-logo";
+
+function shell(accent: "#E8A33D" | "#2E8B57", body: string): string {
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head><body style="margin:0;padding:0;background-color:#F4F5F7;font-family:'Segoe UI',Arial,sans-serif;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#F4F5F7;padding:32px 16px;"><tr><td align="center"><table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background-color:#FFFFFF;border-radius:8px;overflow:hidden;max-width:600px;width:100%;"><tr><td style="background-color:${THEME.brand};padding:28px 32px;"><img src="cid:${LOGO_CID}" alt="${escapeHtml(ORG_NAME)}" width="160" height="38" style="display:block;width:160px;height:38px;border:0;background-color:#FFFFFF;border-radius:4px;"><div style="font-family:Georgia,'Times New Roman',serif;color:#FFFFFF;font-size:18px;font-weight:bold;letter-spacing:.3px;margin-top:14px;">${escapeHtml(ORG_NAME)}</div><div style="color:#C9D3E0;font-size:12px;padding-top:4px;">${escapeHtml(ORG_ADDRESS_LINE_1)}, ${escapeHtml(ORG_ADDRESS_LINE_2)}</div></td></tr><tr><td style="background-color:${accent};height:4px;line-height:4px;font-size:0;">&nbsp;</td></tr>${body}<tr><td style="background-color:#F9FAFB;padding:20px 32px;border-top:1px solid #E5E7EB;"><p style="margin:0;font-size:12px;color:#9CA3AF;text-align:center;">This is an automated notification from the ${escapeHtml(APP_NAME)} system.<br>Please do not reply directly to this email.</p></td></tr></table></td></tr></table></body></html>`;
+}
+
+function details(rows: [string, string][]): string {
+  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #E5E7EB;border-radius:6px;margin-bottom:24px;">${rows.map(([label, value], index) => `<tr><td style="padding:12px 16px;${index < rows.length - 1 ? "border-bottom:1px solid #E5E7EB;" : ""}font-size:13px;color:#6B7280;width:40%;">${label}</td><td style="padding:12px 16px;${index < rows.length - 1 ? "border-bottom:1px solid #E5E7EB;" : ""}font-size:14px;color:#111827;${label === "Amount" ? "font-weight:700;color:#2E8B57;" : ""}">${value}</td></tr>`).join("")}</table>`;
+}
+
+function button(href: string, label: string, outlined = false): string {
+  const style = outlined
+    ? "border-radius:6px;border:1px solid #2E8B57;"
+    : `border-radius:6px;background-color:${THEME.brand};`;
+  const color = outlined ? "#2E8B57" : "#FFFFFF";
+  return `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 auto 12px;"><tr><td style="${style}"><a href="${href}" style="display:inline-block;padding:12px 28px;font-size:14px;font-weight:600;color:${color};text-decoration:none;border-radius:6px;">${label}</a></td></tr></table>`;
+}
+
+export interface AuthorityApprovalEmailData {
+  displayNo: string;
+  /** "Payment Advice" for NEFT, "Cash Payment Voucher" for Cash — see
+   * lib/advice/document-identity.ts. */
+  documentLabel: string;
+  authorityName: string;
+  submittedByName: string;
+  payeeName: string;
+  amount: string | number;
+  natureOfExpenditure: string;
+  billReference: string;
+  paymentMode: string;
+  formDate: string;
+  approvalLink: string;
+  revisionCount?: number;
+  previousRemarks?: string | null;
+}
+
+export interface SentBackEmailData {
+  displayNo: string;
+  documentLabel: string;
+  submittedByName: string;
+  sentBackBy: string;
+  remarks: string;
+  payeeName: string;
+  amount: string | number;
+  editLink: string;
+}
+
+export interface SubmissionRecommendedEmailData {
+  displayNo: string;
+  documentLabel: string;
+  submittedByName: string;
+  recommendedBy: string;
+  payeeName: string;
+  amount: string | number;
+  formDate: string;
+}
+
+export interface SubmissionRejectedEmailData {
+  displayNo: string;
+  documentLabel: string;
+  submittedByName: string;
+  rejectedBy: string;
+  remarks: string;
+  payeeName: string;
+  amount: string | number;
+}
+
+export interface SubmissionConfirmationEmailData {
+  displayNo: string;
+  documentLabel: string;
+  authorityName: string;
+  submittedByName: string;
+  payeeName: string;
+  amount: string | number;
+  paymentMode: string;
+  formDate: string;
+  // Cash submissions never get a Payment Advice PDF, only the Cash Voucher
+  // — omitted (not just absent) rather than always present, mirroring how
+  // cashVoucherPdfLink already only applies for Cash.
+  paymentAdvicePdfLink?: string;
+  cashVoucherPdfLink?: string;
+}
+
+const AUTHORITY_APPROVAL_TEMPLATE = shell("#E8A33D", `<tr><td style="padding:32px;"><p style="margin:0 0 4px;font-size:13px;color:#6B7280;text-transform:uppercase;letter-spacing:.5px;">{{document_label}} Recommendation Request</p><h1 style="margin:0 0 20px;font-family:Georgia,'Times New Roman',serif;font-size:22px;color:#0B1F3A;">{{display_no}}</h1>{{resubmission_note}}<p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#1F2937;">Dear {{authority_name}},<br><br>You've been selected as the Recommending Authority for this {{document_label}}, submitted by <strong>{{submitted_by_name}}</strong> on {{form_date}}. Please review the details below and recommend it or send it back with remarks.</p>${details([["Payee", "{{payee_name}}"], ["Amount", "₹ {{amount}}"], ["Nature of Expenditure", "{{nature_of_expenditure}}"], ["Bill / Reference No.", "{{bill_reference}}"], ["Payment Mode", "{{payment_mode}}"]])}${button("{{approval_link}}", "Review &amp; Recommend")}<p style="margin:0;font-size:12px;line-height:1.6;color:#9CA3AF;text-align:center;">This link is unique to you and does not require a login.<br>If the button doesn't work, copy this link into your browser:<br><a href="{{approval_link}}" style="color:#2E8B57;word-break:break-all;">{{approval_link}}</a></p></td></tr>`);
+
+const SENT_BACK_TEMPLATE = shell("#E8A33D", `<tr><td style="padding:32px;"><p style="margin:0 0 4px;font-size:13px;color:#B45309;text-transform:uppercase;letter-spacing:.5px;font-weight:600;">Action Required</p><h1 style="margin:0 0 20px;font-family:Georgia,'Times New Roman',serif;font-size:22px;color:#0B1F3A;">{{document_label}} {{display_no}} Sent Back</h1><p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#1F2937;">Dear {{submitted_by_name}},<br><br>Your {{document_label}} submission has been sent back by <strong>{{sent_back_by}}</strong> and needs corrections before it can proceed. Please review the remarks below, make the necessary changes, and resubmit.</p><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#FFFBEB;border:1px solid #FDE68A;border-radius:6px;margin-bottom:24px;"><tr><td style="padding:16px;"><p style="margin:0 0 6px;font-size:12px;color:#92400E;text-transform:uppercase;letter-spacing:.5px;font-weight:600;">Remarks</p><p style="margin:0;font-size:14px;line-height:1.6;color:#78350F;">{{remarks}}</p></td></tr></table>${details([["Payee", "{{payee_name}}"], ["Amount", "₹ {{amount}}"]])}${button("{{edit_link}}", "Edit &amp; Resubmit")}<p style="margin:0;font-size:12px;line-height:1.6;color:#9CA3AF;text-align:center;">This link expires in 14 days and does not require a login.<br>If the button doesn't work, copy this link into your browser:<br><a href="{{edit_link}}" style="color:#2E8B57;word-break:break-all;">{{edit_link}}</a></p></td></tr>`);
+
+const SUBMISSION_RECOMMENDED_TEMPLATE = shell("#2E8B57", `<tr><td style="padding:32px;"><p style="margin:0 0 4px;font-size:13px;color:#2E8B57;text-transform:uppercase;letter-spacing:.5px;font-weight:600;">Recommended</p><h1 style="margin:0 0 20px;font-family:Georgia,'Times New Roman',serif;font-size:22px;color:#0B1F3A;">{{display_no}}</h1><p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#1F2937;">Dear {{submitted_by_name}},<br><br>Your {{document_label}} has been recommended by <strong>{{recommended_by}}</strong> and forwarded to the Finance &amp; Accounts team for review and processing.</p>${details([["Payee", "{{payee_name}}"], ["Amount", "₹ {{amount}}"], ["Form Date", "{{form_date}}"], ["Current Stage", "Awaiting Finance Review"]])}<p style="margin:0;font-size:13px;line-height:1.6;color:#6B7280;text-align:center;">The Finance &amp; Accounts team will continue processing your submission.</p></td></tr>`);
+
+const SUBMISSION_REJECTED_TEMPLATE = shell("#E8A33D", `<tr><td style="padding:32px;"><p style="margin:0 0 4px;font-size:13px;color:#A21CAF;text-transform:uppercase;letter-spacing:.5px;font-weight:600;">Submission Rejected</p><h1 style="margin:0 0 20px;font-family:Georgia,'Times New Roman',serif;font-size:22px;color:#0B1F3A;">{{display_no}}</h1><p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#1F2937;">Dear {{submitted_by_name}},<br><br>Your {{document_label}} has been permanently rejected by <strong>{{rejected_by}}</strong>.</p><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#FDF4FF;border:1px solid #F0ABFC;border-radius:6px;margin-bottom:24px;"><tr><td style="padding:16px;"><p style="margin:0 0 6px;font-size:12px;color:#86198F;text-transform:uppercase;letter-spacing:.5px;font-weight:600;">Reason</p><p style="margin:0;font-size:14px;line-height:1.6;color:#701A75;">{{remarks}}</p></td></tr></table>${details([["Payee", "{{payee_name}}"], ["Amount", "₹ {{amount}}"]])}<p style="margin:0;font-size:13px;line-height:1.6;color:#6B7280;">Reference number <strong>{{display_no}}</strong> remains permanently assigned to this rejected record and will never be reused. If a payment request is still required, please create a fresh submission; it will receive a new reference number.</p></td></tr>`);
+
+const SUBMISSION_CONFIRMATION_TEMPLATE = shell("#2E8B57", `<tr><td style="padding:32px;"><p style="margin:0 0 4px;font-size:13px;color:#2E8B57;text-transform:uppercase;letter-spacing:.5px;font-weight:600;">Submission Confirmed</p><h1 style="margin:0 0 20px;font-family:Georgia,'Times New Roman',serif;font-size:22px;color:#0B1F3A;">{{display_no}}</h1><p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#1F2937;">Dear {{submitted_by_name}},<br><br>Your {{document_label}} has been submitted successfully. It has been routed to <strong>{{authority_name}}</strong> (Recommending Authority) for recommendation. You'll be notified once it's actioned.</p>${details([["Payee", "{{payee_name}}"], ["Amount", "₹ {{amount}}"], ["Payment Mode", "{{payment_mode}}"], ["Date", "{{form_date}}"]])}<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:8px;">{{payment_advice_button}}{{cash_voucher_button}}</table><p style="margin:20px 0 0;font-size:13px;line-height:1.6;color:#6B7280;text-align:center;">Remember to attach the corresponding documents (Bill, etc.) as required. For Cash payments, funds are typically disbursed within 3–4 business days after recommendation and Finance processing.</p></td></tr>`);
+
+export function renderAuthorityApprovalEmail(data: AuthorityApprovalEmailData) {
+  const revisionCount = data.revisionCount ?? 0;
+  const previousRemarks = data.previousRemarks
+    ? `<p style="margin:8px 0 0;line-height:1.5;">Previous remarks: ${escapeHtml(data.previousRemarks)}</p>`
+    : "";
+  const resubmissionNote = revisionCount >= 1
+    ? `<div style="margin:0 0 20px;padding:14px 16px;background:#FFFBEB;border:1px solid #FDE68A;border-radius:6px;color:#78350F;font-size:14px;"><strong>This is a resubmission (revision ${revisionCount}) after being sent back with corrections.</strong>${previousRemarks}</div>`
+    : "";
+  const template = AUTHORITY_APPROVAL_TEMPLATE.replace("{{resubmission_note}}", resubmissionNote);
+  return {
+    subject: `${revisionCount >= 1 ? `[Resubmission - Revision ${revisionCount}] ` : ""}Recommendation Required: ${data.documentLabel} ${data.displayNo}`,
+    html: replaceTokens(template, {
+      display_no: data.displayNo, document_label: data.documentLabel, authority_name: data.authorityName,
+      submitted_by_name: data.submittedByName, payee_name: data.payeeName,
+      amount: data.amount, nature_of_expenditure: data.natureOfExpenditure,
+      bill_reference: data.billReference, payment_mode: data.paymentMode,
+      form_date: formatDateOnly(data.formDate), approval_link: data.approvalLink,
+    }),
+  };
+}
+
+export function renderSentBackEmail(data: SentBackEmailData) {
+  return {
+    subject: `Action Required: ${data.documentLabel} ${data.displayNo} Sent Back`,
+    html: replaceTokens(SENT_BACK_TEMPLATE, {
+      display_no: data.displayNo, document_label: data.documentLabel, submitted_by_name: data.submittedByName,
+      sent_back_by: data.sentBackBy, remarks: data.remarks,
+      payee_name: data.payeeName, amount: data.amount, edit_link: data.editLink,
+    }),
+  };
+}
+
+export function renderSubmissionRecommendedEmail(data: SubmissionRecommendedEmailData) {
+  return {
+    subject: `${data.documentLabel} ${data.displayNo} Recommended - Forwarded to Finance`,
+    html: replaceTokens(SUBMISSION_RECOMMENDED_TEMPLATE, {
+      display_no: data.displayNo,
+      document_label: data.documentLabel,
+      submitted_by_name: data.submittedByName,
+      recommended_by: data.recommendedBy,
+      payee_name: data.payeeName,
+      amount: data.amount,
+      form_date: formatDateOnly(data.formDate),
+    }),
+  };
+}
+
+export function renderSubmissionRejectedEmail(data: SubmissionRejectedEmailData) {
+  return {
+    subject: `${data.documentLabel} ${data.displayNo} Rejected`,
+    html: replaceTokens(SUBMISSION_REJECTED_TEMPLATE, {
+      display_no: data.displayNo, document_label: data.documentLabel,
+      submitted_by_name: data.submittedByName, rejected_by: data.rejectedBy,
+      remarks: data.remarks, payee_name: data.payeeName, amount: data.amount,
+    }),
+  };
+}
+
+export interface VerifiedEmailData {
+  displayNo: string;
+  submittedByName: string;
+  verifiedBy: string;
+  /** "Payment Advice" for NEFT, "Cash Payment Voucher" for Cash — see
+   * lib/advice/document-identity.ts. */
+  documentLabel: string;
+  payeeName: string;
+  amount: string | number;
+  formDate: string;
+}
+
+const VERIFIED_TEMPLATE = shell("#2E8B57", `<tr><td style="padding:32px;"><p style="margin:0 0 4px;font-size:13px;color:#2E8B57;text-transform:uppercase;letter-spacing:.5px;font-weight:600;">Verified</p><h1 style="margin:0 0 20px;font-family:Georgia,'Times New Roman',serif;font-size:22px;color:#0B1F3A;">{{display_no}}</h1><p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#1F2937;">Dear {{submitted_by_name}}, your {{document_label}} has been verified by <strong>{{verified_by}}</strong>. It is now Ready for Payment.</p>${details([["Payee", "{{payee_name}}"], ["Amount", "₹ {{amount}}"], ["Date", "{{form_date}}"]])}</td></tr>`);
+
+export function renderVerifiedEmail(data: VerifiedEmailData) {
+  return {
+    subject: `${data.documentLabel} ${data.displayNo} Verified`,
+    html: replaceTokens(VERIFIED_TEMPLATE, {
+      display_no: data.displayNo, submitted_by_name: data.submittedByName,
+      verified_by: data.verifiedBy, document_label: data.documentLabel,
+      payee_name: data.payeeName, amount: data.amount, form_date: formatDateOnly(data.formDate),
+    }),
+  };
+}
+
+export interface PaymentDoneEmailData {
+  displayNo: string;
+  submittedByName: string;
+  /** "Payment Advice" for NEFT, "Cash Payment Voucher" for Cash — same
+   * caller-supplied derivation as VerifiedEmailData.documentLabel. */
+  documentLabel: string;
+  payeeName: string;
+  amount: string | number;
+  formDate: string;
+}
+
+const PAYMENT_DONE_TEMPLATE = shell("#2E8B57", `<tr><td style="padding:32px;"><p style="margin:0 0 4px;font-size:13px;color:#2E8B57;text-transform:uppercase;letter-spacing:.5px;font-weight:600;">Payment Done</p><h1 style="margin:0 0 20px;font-family:Georgia,'Times New Roman',serif;font-size:22px;color:#0B1F3A;">{{display_no}}</h1><p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#1F2937;">Dear {{submitted_by_name}}, your {{document_label}} {{display_no}} has been paid.</p>${details([["Payee", "{{payee_name}}"], ["Amount", "₹ {{amount}}"], ["Date", "{{form_date}}"]])}</td></tr>`);
+
+export function renderPaymentDoneEmail(data: PaymentDoneEmailData) {
+  return {
+    subject: `${data.documentLabel} ${data.displayNo} - Payment Done`,
+    html: replaceTokens(PAYMENT_DONE_TEMPLATE, {
+      display_no: data.displayNo, submitted_by_name: data.submittedByName,
+      document_label: data.documentLabel, payee_name: data.payeeName,
+      amount: data.amount, form_date: formatDateOnly(data.formDate),
+    }),
+  };
+}
+
+export interface CashReceiptReceivedEmailData {
+  serialNo: string;
+  issuerName: string;
+  partyName: string;
+  amount: string | number;
+  receiptDate: string;
+  /** Already formatted for display (IST date and time). */
+  receivedOn: string;
+  receivedBy: string;
+  note?: string | null;
+}
+
+/** Sent to the issuer when Finance marks a Cash Receipt's cash as received.
+ * Same shell, colours and escaping as the Payment Done email; the Note row
+ * appears only when Finance wrote one. */
+export function renderCashReceiptReceivedEmail(data: CashReceiptReceivedEmailData) {
+  const rows: [string, string][] = [
+    ["Receipt No.", "{{serial_no}}"],
+    ["Party", "{{party_name}}"],
+    ["Amount", "₹ {{amount}}"],
+    ["Receipt date", "{{receipt_date}}"],
+    ["Received on", "{{received_on}}"],
+    ["Received by", "{{received_by}}"],
+    ...(data.note ? [["Note", "{{note}}"] as [string, string]] : []),
+  ];
+  const template = shell("#2E8B57", `<tr><td style="padding:32px;"><p style="margin:0 0 4px;font-size:13px;color:#2E8B57;text-transform:uppercase;letter-spacing:.5px;font-weight:600;">Cash Received</p><h1 style="margin:0 0 20px;font-family:Georgia,'Times New Roman',serif;font-size:22px;color:#0B1F3A;">{{serial_no}}</h1><p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#1F2937;">Dear {{issuer_name}}, the Accounts Department has received the cash for Cash Receipt {{serial_no}}.</p>${details(rows)}</td></tr>`);
+  return {
+    subject: `Cash received: ${data.serialNo}`,
+    html: replaceTokens(template, {
+      serial_no: data.serialNo, issuer_name: data.issuerName, party_name: data.partyName,
+      amount: data.amount, receipt_date: formatDateOnly(data.receiptDate),
+      received_on: data.receivedOn, received_by: data.receivedBy, note: data.note ?? "",
+    }),
+  };
+}
+
+/**
+ * One email per payment_entries row — NEFT (Payment Advice) only, per the
+ * multi-part payment model (see the project notes). Deliberately not a
+ * cumulative "payment summary" — each email is accurate only to the moment
+ * that specific entry was recorded, showing that entry's own amount and
+ * remarks, and stating plainly whether it was a partial payment (with the
+ * remaining balance) or the final, fully-settling one. Two payments on one
+ * advice send two separate emails.
+ */
+export interface PaymentEntryEmailData {
+  displayNo: string;
+  submittedByName: string;
+  documentLabel: string;
+  payeeName: string;
+  entryAmount: string | number;
+  remarks: string;
+  isFinal: boolean;
+  totalPaid: string | number;
+  payableAmount: string | number;
+  remaining: string | number;
+  formDate: string;
+}
+
+const PAYMENT_ENTRY_TEMPLATE = shell("#2E8B57", `<tr><td style="padding:32px;"><p style="margin:0 0 4px;font-size:13px;color:#2E8B57;text-transform:uppercase;letter-spacing:.5px;font-weight:600;">{{status_label}}</p><h1 style="margin:0 0 20px;font-family:Georgia,'Times New Roman',serif;font-size:22px;color:#0B1F3A;">{{display_no}}</h1><p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#1F2937;">Dear {{submitted_by_name}}, a payment of <strong>₹ {{entry_amount}}</strong> has been recorded against your {{document_label}} {{display_no}}.{{status_sentence}}</p>${details([["Payee", "{{payee_name}}"], ["This Payment", "₹ {{entry_amount}}"], ["Remarks", "{{remarks}}"], ["Paid So Far", "₹ {{total_paid}} of ₹ {{payable_amount}}"], ["Payable Amount", "₹ {{payable_amount}}"], ["Balance Remaining", "₹ {{remaining}}"], ["Date", "{{form_date}}"]])}</td></tr>`);
+
+export function renderPaymentEntryEmail(data: PaymentEntryEmailData) {
+  const statusLabel = data.isFinal ? "Payment Complete" : "Partial Payment Recorded";
+  const statusSentence = data.isFinal
+    ? " This is the final payment - the full payable amount has now been settled."
+    : " This is a partial payment; ₹ {{remaining}} remains to be paid.";
+  return {
+    subject: `${data.documentLabel} ${data.displayNo} - ${statusLabel}`,
+    html: replaceTokens(PAYMENT_ENTRY_TEMPLATE, {
+      status_label: statusLabel,
+      status_sentence: statusSentence,
+      display_no: data.displayNo,
+      submitted_by_name: data.submittedByName,
+      document_label: data.documentLabel,
+      payee_name: data.payeeName,
+      entry_amount: data.entryAmount,
+      remarks: data.remarks,
+      total_paid: data.totalPaid,
+      payable_amount: data.payableAmount,
+      remaining: data.remaining,
+      form_date: formatDateOnly(data.formDate),
+    }),
+  };
+}
+
+export interface VendorMsmeRequestEmailData {
+  vendorName: string;
+  submitterName: string;
+  /** Already formatted (DD/MM/YYYY) — see computeMsmeRequestDeadline in
+   * lib/advice/msme-email-template.ts, which does the actual date math. */
+  deadline: string;
+}
+
+// Sent to the vendor directly (not the submitter) by the app itself — see
+// the project notes's 2026-10-01 revision note. Same "Action Required" amber
+// styling as SENT_BACK/AUTHORITY_APPROVAL above, since this also asks its
+// recipient (the vendor) to act. Wording is the human-specified statutory
+// notice text from the original brief — don't reword without checking,
+// since it references a specific MCA order.
+const VENDOR_MSME_REQUEST_TEMPLATE = shell("#E8A33D", `<tr><td style="padding:32px;"><p style="margin:0 0 4px;font-size:13px;color:#B45309;text-transform:uppercase;letter-spacing:.5px;font-weight:600;">Action Required</p><h1 style="margin:0 0 20px;font-family:Georgia,'Times New Roman',serif;font-size:22px;color:#0B1F3A;">MSME Status Declaration Required</h1><p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#1F2937;">Dear {{vendor_name}},<br><br>As per the Ministry of Corporate Affairs' Specified Companies (Furnishing of information about payment to micro and small enterprise suppliers) Order, 2019 (attached), companies must report payments to MSME suppliers delayed beyond 45 days.</p><p style="margin:0 0 12px;font-size:15px;line-height:1.6;color:#1F2937;">To comply, we need your MSME status on record. Please share one of the following within 7 days:</p><ol style="margin:0 0 20px;padding-left:20px;font-size:15px;line-height:1.8;color:#1F2937;"><li>If registered as Micro/Small/Medium: your Udyam Registration Certificate, or</li><li>If not registered under MSME: a signed declaration on your letterhead (template attached)</li></ol><p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#1F2937;">If we don't hear back by <strong>{{deadline}}</strong>, we'll record your status as non-MSME for reporting purposes.</p><p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#1F2937;">This is a statutory requirement. We appreciate a prompt response.</p><p style="margin:0;font-size:15px;line-height:1.6;color:#1F2937;">Regards,<br>{{submitter_name}}<br>${escapeHtml(ORG_NAME)}</p></td></tr>`);
+
+export function renderVendorMsmeRequestEmail(data: VendorMsmeRequestEmailData) {
+  return {
+    subject: `MSME Status Declaration Required: ${data.vendorName}`,
+    html: replaceTokens(VENDOR_MSME_REQUEST_TEMPLATE, {
+      vendor_name: data.vendorName,
+      submitter_name: data.submitterName,
+      deadline: data.deadline,
+    }),
+  };
+}
+
+export function renderSubmissionConfirmationEmail(data: SubmissionConfirmationEmailData) {
+  const paymentAdviceButton = data.paymentMode !== "CASH" && data.paymentAdvicePdfLink
+    ? `<tr><td align="center">${button("{{payment_advice_pdf_link}}", "Download Payment Advice")}</td></tr>`
+    : "";
+  const cashVoucherButton = data.paymentMode === "CASH" && data.cashVoucherPdfLink
+    ? `<tr><td align="center">${button("{{cash_voucher_pdf_link}}", "Download Cash Payment Voucher", true)}</td></tr>`
+    : "";
+  const template = SUBMISSION_CONFIRMATION_TEMPLATE.replace(
+    "{{payment_advice_button}}",
+    paymentAdviceButton,
+  ).replace("{{cash_voucher_button}}", cashVoucherButton);
+  return {
+    subject: `${data.documentLabel} ${data.displayNo} Submitted`,
+    html: replaceTokens(template, {
+      display_no: data.displayNo, document_label: data.documentLabel, authority_name: data.authorityName,
+      submitted_by_name: data.submittedByName, payee_name: data.payeeName,
+      amount: data.amount, payment_mode: data.paymentMode, form_date: formatDateOnly(data.formDate),
+      payment_advice_pdf_link: data.paymentAdvicePdfLink,
+      cash_voucher_pdf_link: data.cashVoucherPdfLink,
+    }),
+  };
+}

@@ -1,0 +1,343 @@
+"use client";
+
+import { useState } from "react";
+import { formatIstDate } from "@/lib/date-time";
+import { AttachmentPreview } from "@/components/ui/AttachmentPreview";
+
+type ReviewFields = {
+  payeeName: string;
+  amount: string;
+  natureOfExpenditure: string;
+  billReference: string;
+  paymentMode: string;
+  submittedByName: string;
+  formDate: string;
+};
+
+type ReviewDoc = { id: string; fileName: string; label: string };
+
+function formatDateTime(iso: string) {
+  return formatIstDate(iso);
+}
+
+export function AuthorityApprovalView({
+  token,
+  authorityName,
+  identityConfirmed,
+  alreadyApproved,
+  alreadyRejected,
+  approvedAt,
+  rejectedAt,
+  rejectedRemarks,
+  finallyRejected,
+  finalRejectedAt,
+  finalRejectionRemarks,
+  allowFinalReject,
+  submittedByName,
+  fields,
+  documents,
+}: {
+  token: string;
+  authorityName: string;
+  identityConfirmed: boolean;
+  alreadyApproved: boolean;
+  alreadyRejected: boolean;
+  approvedAt: string | null;
+  rejectedAt: string | null;
+  rejectedRemarks: string | null;
+  finallyRejected: boolean;
+  finalRejectedAt: string | null;
+  finalRejectionRemarks: string | null;
+  allowFinalReject: boolean;
+  submittedByName: string;
+  fields: ReviewFields;
+  documents: ReviewDoc[];
+}) {
+  const [justApproved, setJustApproved] = useState(false);
+  const [justRejected, setJustRejected] = useState(false);
+  const [justFinallyRejected, setJustFinallyRejected] = useState(false);
+
+  const [showReject, setShowReject] = useState(false);
+  const [showFinalReject, setShowFinalReject] = useState(false);
+  const [finalRemarks, setFinalRemarks] = useState("");
+  const [remarks, setRemarks] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const [confirmed, setConfirmed] = useState(identityConfirmed);
+  const [emailInput, setEmailInput] = useState("");
+  const [identityError, setIdentityError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
+
+  async function confirmIdentity() {
+    setIdentityError(null);
+    setConfirming(true);
+    try {
+      const res = await fetch(`/api/authority-approval/${token}/confirm-identity`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: emailInput }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setIdentityError(data.error ?? "Could not confirm your email.");
+        return;
+      }
+      setConfirmed(true);
+    } catch {
+      setIdentityError("Could not reach the server. Please try again.");
+    } finally {
+      setConfirming(false);
+    }
+  }
+
+  async function rejectFinal() {
+    setError(null); setSubmitting(true);
+    try {
+      const res = await fetch(`/api/authority-approval/${token}/reject-final`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ remarks: finalRemarks }) });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error ?? "Could not reject this submission."); return; }
+      setJustFinallyRejected(true);
+    } catch { setError("Could not reach the server. Please try again."); }
+    finally { setSubmitting(false); }
+  }
+
+  async function approve() {
+    setError(null);
+    setSubmitting(true);
+    try {
+      const res = await fetch(`/api/authority-approval/${token}/approve`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error ?? "Could not record your recommendation.");
+        return;
+      }
+      setJustApproved(true);
+    } catch {
+      setError("Could not reach the server. Please try again.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function reject() {
+    setError(null);
+    setSubmitting(true);
+    try {
+      const res = await fetch(`/api/authority-approval/${token}/reject`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ remarks }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error ?? "Could not send this back.");
+        return;
+      }
+      setJustRejected(true);
+    } catch {
+      setError("Could not reach the server. Please try again.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const isApproved = alreadyApproved || justApproved;
+  const isRejected = (alreadyRejected || justRejected) && !isApproved;
+
+  if (finallyRejected || justFinallyRejected) return <ConfirmationBanner tone="rejected">Permanently rejected{finalRejectedAt ? ` on ${formatDateTime(finalRejectedAt)}` : ""}.{finalRejectionRemarks ? <span className="mt-2 block">Remarks: {finalRejectionRemarks}</span> : null} The reference number remains assigned and will not be reused.</ConfirmationBanner>;
+
+  if (justApproved) {
+    return (
+      <ConfirmationBanner tone="approved">
+        Recommended. This has been forwarded to Finance for processing. No further action needed
+        from you.
+      </ConfirmationBanner>
+    );
+  }
+
+  if (justRejected) {
+    return (
+      <ConfirmationBanner tone="rejected">
+        Sent back to {submittedByName} with your remarks. They&apos;ve been notified to make
+        corrections and resubmit.
+      </ConfirmationBanner>
+    );
+  }
+
+  if (isApproved) {
+    return (
+      <ConfirmationBanner tone="approved">
+        You already recommended this{approvedAt ? ` on ${formatDateTime(approvedAt)}` : ""}.
+      </ConfirmationBanner>
+    );
+  }
+
+  if (isRejected) {
+    return (
+      <ConfirmationBanner tone="rejected">
+        You already sent this back{rejectedAt ? ` on ${formatDateTime(rejectedAt)}` : ""}.
+        {rejectedRemarks ? (
+          <span className="mt-2 block text-sm font-normal text-[#78350f]">
+            Your remarks: {rejectedRemarks}
+          </span>
+        ) : null}
+      </ConfirmationBanner>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-8">
+      <section className="flex flex-col gap-2 rounded-md border border-gray-200 p-4">
+        <Row label="Payee" value={fields.payeeName} />
+        <Row label="Amount" value={`₹ ${fields.amount}`} />
+        <Row label="Nature of Expenditure" value={fields.natureOfExpenditure} block />
+        <Row label="Bill / Reference No." value={fields.billReference} />
+        <Row label="Payment Mode" value={fields.paymentMode} />
+        <Row label="Submitted By" value={fields.submittedByName} />
+        <Row label="Date" value={fields.formDate} />
+      </section>
+
+      <section className="flex flex-col gap-2 rounded-md border border-gray-200 p-4">
+        <h2 className="font-heading text-lg text-brand">Attached Documents</h2>
+        {documents.length === 0 ? (
+          <p className="text-sm text-gray-500">No documents attached.</p>
+        ) : (
+          <ul className="flex flex-col gap-1">
+            {documents.map((doc) => (
+              <li key={doc.id}>
+                <span className="text-sm">{doc.label}: {doc.fileName} · </span>
+                <AttachmentPreview
+                  fileName={doc.fileName}
+                  href={`/api/authority-approval/${token}/attachments/${doc.id}`}
+                />
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {confirmed ? (
+        <>
+          {error ? (
+            <div className="rounded-md border border-[#b3261e]/30 bg-[#b3261e]/5 px-4 py-3 text-sm font-medium text-[#b3261e]">
+              {error}
+            </div>
+          ) : null}
+
+          <div className="flex gap-3">
+            <button
+              type="button"
+              onClick={approve}
+              disabled={submitting}
+              className="rounded-md bg-[#2e8b57] px-6 py-2.5 text-sm font-medium text-white hover:bg-[#2e8b57]/90 disabled:opacity-50"
+            >
+              {submitting ? "Recommending…" : "Recommend"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowReject((v) => !v)}
+              disabled={submitting}
+              className="rounded-md border border-gray-300 px-6 py-2.5 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+            >
+              Send Back
+            </button>
+            {allowFinalReject ? <button type="button" onClick={() => setShowFinalReject((v) => !v)} disabled={submitting} className="rounded-md border border-red-500 px-6 py-2.5 text-sm font-medium text-red-950 hover:bg-red-50 disabled:opacity-50">Reject</button> : null}
+          </div>
+
+          {showReject ? (
+            <div className="flex flex-col gap-3 rounded-md border border-gray-300 bg-gray-50 p-4">
+              <label className="text-sm font-medium text-brand">
+                Remarks for {submittedByName}{" "}
+                <span className="text-xs font-normal text-[#b3261e]">Required</span>
+              </label>
+              <textarea
+                value={remarks}
+                onChange={(e) => setRemarks(e.target.value)}
+                rows={3}
+                className="admin-filter-input"
+              />
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={reject}
+                  disabled={submitting || !remarks.trim()}
+                  className="rounded-md bg-brand px-4 py-2 text-sm font-medium text-white hover:bg-brand/90 disabled:opacity-50"
+                >
+                  {submitting ? "Sending…" : "Submit & Send Back"}
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {showFinalReject && allowFinalReject ? <div className="flex flex-col gap-3 rounded-md border border-red-400 bg-red-50 p-4"><p className="text-sm text-red-950">This permanently closes the submission. Its reference number will not be reused.</p><label className="text-sm font-medium text-red-950">Rejection remarks <span className="text-xs font-normal text-[#b3261e]">Required</span></label><textarea value={finalRemarks} onChange={(e) => setFinalRemarks(e.target.value)} rows={3} className="admin-filter-input"/><button type="button" onClick={rejectFinal} disabled={submitting || !finalRemarks.trim()} className="w-fit rounded-md bg-red-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50">{submitting ? "Rejecting…" : "Confirm Reject"}</button></div> : null}
+
+          <p className="text-xs text-gray-500">Reviewing as {authorityName}.</p>
+        </>
+      ) : (
+        <div className="flex flex-col gap-3 rounded-md border border-gray-300 bg-gray-50 p-4">
+          <label className="text-sm font-medium text-brand">
+            Confirm your email to continue
+          </label>
+          <p className="text-xs text-gray-500">
+            For security, please confirm the email address this recommendation request was sent to before
+            reviewing or actioning it.
+          </p>
+          <input
+            type="email"
+            value={emailInput}
+            onChange={(e) => setEmailInput(e.target.value)}
+            placeholder="you@example.com"
+            className="admin-filter-input"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && emailInput.trim() && !confirming) confirmIdentity();
+            }}
+          />
+          {identityError ? (
+            <div className="rounded-md border border-[#b3261e]/30 bg-[#b3261e]/5 px-4 py-3 text-sm font-medium text-[#b3261e]">
+              {identityError}
+            </div>
+          ) : null}
+          <div>
+            <button
+              type="button"
+              onClick={confirmIdentity}
+              disabled={confirming || !emailInput.trim()}
+              className="rounded-md bg-brand px-6 py-2.5 text-sm font-medium text-white hover:bg-brand/90 disabled:opacity-50"
+            >
+              {confirming ? "Confirming…" : "Continue"}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ConfirmationBanner({
+  tone,
+  children,
+}: {
+  tone: "approved" | "rejected";
+  children: React.ReactNode;
+}) {
+  const styles =
+    tone === "approved"
+      ? "border-[#2e8b57]/40 bg-[#2e8b57]/10 text-[#1e5c39]"
+      : "border-[#e8a33d]/40 bg-[#e8a33d]/10 text-[#8a5a12]";
+  return (
+    <div className={`rounded-md border p-6 text-sm font-medium ${styles}`}>{children}</div>
+  );
+}
+
+function Row({ label, value, block }: { label: string; value: string; block?: boolean }) {
+  return (
+    <div className={block ? "flex flex-col gap-1" : "flex items-baseline gap-2 text-sm"}>
+      <span className="min-w-[200px] text-xs font-medium uppercase tracking-wide text-gray-500">
+        {label}
+      </span>
+      <span className={block ? "whitespace-pre-wrap text-sm text-[#171717]" : "text-sm text-[#171717]"}>
+        {value}
+      </span>
+    </div>
+  );
+}

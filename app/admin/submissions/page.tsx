@@ -1,0 +1,593 @@
+import Link from "next/link";
+import { Fragment } from "react";
+import { and, count, sum } from "drizzle-orm";
+import { db } from "@/lib/db";
+import { paymentAdvices } from "@/lib/db/schema";
+import { StageBadge } from "@/components/admin/StageBadge";
+import { StageLegend } from "@/components/admin/StageLegend";
+import {
+  ADMIN_LIST_PAGE_SIZE,
+  AdminTab,
+  buildAdviceWhere,
+  buildAdminListOrderBy,
+  buildTabCondition,
+  isAdminTab,
+  parseAdviceFilterParams,
+  searchParamsRecordToURLSearchParams,
+  SortColumn,
+} from "@/lib/admin/filters";
+import { PaymentMode } from "@/lib/validation/payment-advice";
+import { getAdminSession } from "@/lib/admin-session";
+import { displayNoFor, submissionTypeLabelFor } from "@/lib/advice/document-identity";
+import { defaultPaymentModeForRoles, ownsSubmissionType } from "@/lib/admin/role-scope";
+import { bulkActionForTab, needsPayableCondition } from "@/lib/advice/bulk-finance-actions";
+import { payableIsSet, payableNotSetLabel } from "@/lib/advice/payable-status";
+import { BulkFinanceProvider, BulkRowCheckbox, BulkSelectAll, type BulkRow } from "@/components/admin/BulkFinanceActions";
+import { pipelineStageFor } from "@/lib/advice/pipeline-stage";
+import { STAGE_FOR_TAB, STAGE_STYLE } from "@/lib/advice/stage-style";
+import { SentBackIndicators } from "@/components/admin/SentBackIndicators";
+import { BankDetailsMismatchBadge } from "@/components/admin/BankDetailsMismatchBadge";
+import { sentBackStatus } from "@/lib/advice/send-back-status";
+import { formatDateOnly, formatIstDate } from "@/lib/date-time";
+
+type SearchParamsRecord = Record<string, string | string[] | undefined>;
+
+export const dynamic = "force-dynamic";
+
+function formatAmount(value: string) {
+  return Number(value).toLocaleString("en-IN", { minimumFractionDigits: 2 });
+}
+
+function queryString(base: SearchParamsRecord, updates: Record<string, string | undefined>) {
+  const params = searchParamsRecordToURLSearchParams(base);
+  for (const [key, value] of Object.entries(updates)) {
+    if (value === undefined || value === "") params.delete(key);
+    else params.set(key, value);
+  }
+  return `?${params.toString()}`;
+}
+
+function SortHeader({
+  label,
+  column,
+  searchParams,
+  currentSort,
+  currentDir,
+}: {
+  label: string;
+  column: SortColumn;
+  searchParams: SearchParamsRecord;
+  currentSort?: string;
+  currentDir?: string;
+}) {
+  const isActive = currentSort === column;
+  const nextDir = isActive && currentDir === "desc" ? "asc" : "desc";
+  return (
+    <Link
+      href={queryString(searchParams, { sort: column, dir: nextDir, page: undefined })}
+      className="flex items-center gap-1 hover:text-brand"
+    >
+      {label}
+      {isActive ? <span>{currentDir === "asc" ? "▲" : "▼"}</span> : null}
+    </Link>
+  );
+}
+
+export default async function AdminListPage({
+  searchParams,
+}: {
+  searchParams: Promise<SearchParamsRecord>;
+}) {
+  const sp = await searchParams;
+  const session = await getAdminSession();
+
+  const filterParams = parseAdviceFilterParams(searchParamsRecordToURLSearchParams(sp));
+  // Default filter, not an authorization wall: only applied when the URL
+  // never mentioned paymentMode at all (a fresh landing) — an explicit
+  // "All" selection submits paymentMode="" and is left alone. Any signed-in
+  // user can still change or clear this filter; nothing is backend-blocked.
+  if (sp.paymentMode === undefined && session) {
+    filterParams.paymentMode = defaultPaymentModeForRoles(session.roles);
+  }
+
+  const tabParam = Array.isArray(sp.tab) ? sp.tab[0] : sp.tab;
+  const tab: AdminTab = isAdminTab(tabParam) ? tabParam : "waiting_authority";
+  const baseWhere = buildAdviceWhere(filterParams);
+  const bulkAction = bulkActionForTab(tab);
+  const columnCount = (tab === "rejected" ? 11 : tab === "sent_back" ? 10 : 9) + (bulkAction ? 1 : 0);
+  // "Needs payable calculation" filter, Verified tab only: items that cannot
+  // be paid yet because their saved payable amount (or Bill passed for) is
+  // missing. Verify itself is never blocked; the calculator appears after it.
+  const needsPayableFilter = tab === "verified_ready_payment" && (Array.isArray(sp.needsPayable) ? sp.needsPayable[0] : sp.needsPayable) === "1";
+  const where = and(baseWhere, buildTabCondition(tab), needsPayableFilter ? needsPayableCondition() : undefined);
+  const sort = Array.isArray(sp.sort) ? sp.sort[0] : sp.sort;
+  const dir = Array.isArray(sp.dir) ? sp.dir[0] : sp.dir;
+  const orderBy = buildAdminListOrderBy(tab, sort, dir);
+
+  const pageParam = Array.isArray(sp.page) ? sp.page[0] : sp.page;
+  const page = Math.max(1, Number(pageParam) || 1);
+
+  const [
+    rows,
+    totalsRow,
+    waitingCount,
+    awaitingFinanceCount,
+    advancePaymentCount,
+    receivedCount,
+    verifiedCount,
+    partialPaymentDoneCount,
+    fullyPaymentSettledCount,
+    paymentDoneCount,
+    sentBackCount,
+    rejectedCount,
+  ] = await Promise.all([
+    db
+      .select({
+        id: paymentAdvices.id,
+        serialNo: paymentAdvices.serialNo,
+        cashVoucherNo: paymentAdvices.cashVoucherNo,
+        isAdvance: paymentAdvices.isAdvance,
+        advanceNo: paymentAdvices.advanceNo,
+        formDate: paymentAdvices.formDate,
+        payeeName: paymentAdvices.payeeName,
+        amount: paymentAdvices.amount,
+        paymentMode: paymentAdvices.paymentMode,
+        submittedByName: paymentAdvices.submittedByName,
+        submittedByDepartment: paymentAdvices.submittedByDepartment,
+        status: paymentAdvices.status,
+        adminRemarks: paymentAdvices.adminRemarks,
+        sentBackAt: paymentAdvices.sentBackAt,
+        editTokenExpiresAt: paymentAdvices.editTokenExpiresAt,
+        rejectedAt: paymentAdvices.rejectedAt,
+        rejectedBy: paymentAdvices.rejectedBy,
+        rejectionRemarks: paymentAdvices.rejectionRemarks,
+        // Everything pipelineStageFor() needs to derive the real per-row
+        // stage for the Status badge — see the Part 1 fix in the project notes.
+        authorityApprovedAt: paymentAdvices.authorityApprovedAt,
+        financeReceivedAt: paymentAdvices.financeReceivedAt,
+        verifiedAt: paymentAdvices.verifiedAt,
+        paymentDoneAt: paymentAdvices.paymentDoneAt,
+        totalPaid: paymentAdvices.totalPaid,
+        bankDetailsMismatch: paymentAdvices.bankDetailsMismatch,
+        // Bulk payment table: what is due per row (same saved values the
+        // single-item payment actions use).
+        payableAmount: paymentAdvices.payableAmount,
+        billPassedFor: paymentAdvices.billPassedFor,
+        basicAmount: paymentAdvices.basicAmount,
+        gstAmount: paymentAdvices.gstAmount,
+      })
+      .from(paymentAdvices)
+      .where(where)
+      .orderBy(...orderBy)
+      .limit(ADMIN_LIST_PAGE_SIZE)
+      .offset((page - 1) * ADMIN_LIST_PAGE_SIZE),
+    db
+      .select({ count: count(), sum: sum(paymentAdvices.amount) })
+      .from(paymentAdvices)
+      .where(where),
+    // Also selects sum() (not just count()) so these same 6 queries can
+    // back both the tab badges (count only) and, for the ALL-role
+    // dashboard, the summary cards (count + total amount) — one set of
+    // queries, two UI uses, always in sync with each other.
+    db
+      .select({ count: count(), sum: sum(paymentAdvices.amount) })
+      .from(paymentAdvices)
+      .where(and(baseWhere, buildTabCondition("waiting_authority"))),
+    db
+      .select({ count: count(), sum: sum(paymentAdvices.amount) })
+      .from(paymentAdvices)
+      .where(and(baseWhere, buildTabCondition("awaiting_finance"))),
+    db
+      .select({ count: count(), sum: sum(paymentAdvices.amount) })
+      .from(paymentAdvices)
+      .where(and(baseWhere, buildTabCondition("advance_payment"))),
+    db
+      .select({ count: count(), sum: sum(paymentAdvices.amount) })
+      .from(paymentAdvices)
+      .where(and(baseWhere, buildTabCondition("received_in_process"))),
+    db
+      .select({ count: count(), sum: sum(paymentAdvices.amount) })
+      .from(paymentAdvices)
+      .where(and(baseWhere, buildTabCondition("verified_ready_payment"))),
+    db
+      .select({ count: count(), sum: sum(paymentAdvices.amount) })
+      .from(paymentAdvices)
+      .where(and(baseWhere, buildTabCondition("partial_payment_done"))),
+    db
+      .select({ count: count(), sum: sum(paymentAdvices.amount) })
+      .from(paymentAdvices)
+      .where(and(baseWhere, buildTabCondition("fully_payment_settled"))),
+    db
+      .select({ count: count(), sum: sum(paymentAdvices.amount) })
+      .from(paymentAdvices)
+      .where(and(baseWhere, buildTabCondition("payment_done"))),
+    db
+      .select({ count: count(), sum: sum(paymentAdvices.amount) })
+      .from(paymentAdvices)
+      .where(and(baseWhere, buildTabCondition("sent_back"))),
+    db.select({ count: count(), sum: sum(paymentAdvices.amount) }).from(paymentAdvices)
+      .where(and(baseWhere, buildTabCondition("rejected"))),
+  ]);
+
+  const totalCount = totalsRow[0]?.count ?? 0;
+  const totalAmount = Number(totalsRow[0]?.sum ?? 0);
+  const totalPages = Math.max(1, Math.ceil(totalCount / ADMIN_LIST_PAGE_SIZE));
+  // Counted over every page (and the current filters), not only the rows shown.
+  const needsPayableCount = tab === "verified_ready_payment"
+    ? (await db.select({ count: count() }).from(paymentAdvices).where(and(baseWhere, buildTabCondition(tab), needsPayableCondition())))[0]?.count ?? 0
+    : 0;
+  const needsPayableHref = (on: boolean) => {
+    const params = searchParamsRecordToURLSearchParams(sp);
+    params.set("tab", "verified_ready_payment");
+    params.delete("page");
+    if (on) params.set("needsPayable", "1"); else params.delete("needsPayable");
+    return `/admin/submissions?${params.toString()}`;
+  };
+
+  return (
+    <div className="flex flex-col gap-6">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h1 className="font-heading text-3xl text-brand">Submissions</h1>
+          <p className="mt-1 text-sm text-gray-600">
+            {totalCount} matching · ₹ {totalAmount.toLocaleString("en-IN", { minimumFractionDigits: 2 })} total
+          </p>
+        </div>
+        <div className="flex gap-3">
+          <a
+            href={`/api/admin/export?${searchParamsRecordToURLSearchParams(sp).toString()}`}
+            className="rounded-md border border-brand px-4 py-2 text-sm font-medium text-brand hover:bg-brand/5"
+          >
+            Export to Excel
+          </a>
+          <Link
+            href="/admin/vendors/new"
+            className="rounded-md border border-brand px-4 py-2 text-sm font-medium text-brand hover:bg-brand/5"
+          >
+            New Vendor
+          </Link>
+          <Link
+            href="/admin/staff"
+            className="rounded-md bg-brand px-4 py-2 text-sm font-medium text-white hover:bg-brand/90"
+          >
+            Manage Staff &amp; Authorities
+          </Link>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <TabLink
+          label="Waiting on Authority"
+          tab="waiting_authority"
+          activeTab={tab}
+          count={waitingCount[0]?.count ?? 0}
+          searchParams={sp}
+        />
+        <TabLink
+          label="Awaiting Finance Review"
+          tab="awaiting_finance"
+          activeTab={tab}
+          count={awaitingFinanceCount[0]?.count ?? 0}
+          searchParams={sp}
+        />
+        <TabLink
+          label="Advance Payment"
+          tab="advance_payment"
+          activeTab={tab}
+          count={advancePaymentCount[0]?.count ?? 0}
+          searchParams={sp}
+        />
+        <TabLink
+          label="Received & In Process"
+          tab="received_in_process"
+          activeTab={tab}
+          count={receivedCount[0]?.count ?? 0}
+          searchParams={sp}
+        />
+        <TabLink
+          label="Verified - Ready for Payment"
+          tab="verified_ready_payment"
+          activeTab={tab}
+          count={verifiedCount[0]?.count ?? 0}
+          searchParams={sp}
+        />
+        <TabLink
+          label="Partial Payment Done"
+          tab="partial_payment_done"
+          activeTab={tab}
+          count={partialPaymentDoneCount[0]?.count ?? 0}
+          searchParams={sp}
+        />
+        <TabLink
+          label="Fully Payment Settled"
+          tab="fully_payment_settled"
+          activeTab={tab}
+          count={fullyPaymentSettledCount[0]?.count ?? 0}
+          searchParams={sp}
+        />
+        <TabLink
+          label="Payment Done (Cash)"
+          tab="payment_done"
+          activeTab={tab}
+          count={paymentDoneCount[0]?.count ?? 0}
+          searchParams={sp}
+        />
+        <TabLink
+          label="Sent Back"
+          tab="sent_back"
+          activeTab={tab}
+          count={sentBackCount[0]?.count ?? 0}
+          searchParams={sp}
+        />
+        <TabLink label="Rejected" tab="rejected" activeTab={tab} count={rejectedCount[0]?.count ?? 0} searchParams={sp} />
+        <TabLink label="All" tab="all" activeTab={tab} count={null} searchParams={sp} />
+        <StageLegend />
+      </div>
+
+      <form
+        method="get"
+        className="grid grid-cols-2 gap-4 rounded-md border border-gray-200 p-4 sm:grid-cols-4 lg:grid-cols-7"
+      >
+        <input type="hidden" name="tab" value={tab} />
+        {tab === "all" ? (
+          <FilterField label="Status">
+            <select name="status" defaultValue={filterParams.status ?? ""} className="admin-filter-input">
+              <option value="">All</option>
+              <option value="SUBMITTED">Submitted</option>
+              <option value="SENT_BACK">Sent Back</option>
+              <option value="REJECTED">Rejected</option>
+              <option value="APPROVED">Approved</option>
+            </select>
+          </FilterField>
+        ) : null}
+        <FilterField label="From (Form Date)">
+          <input type="date" name="dateFrom" defaultValue={filterParams.dateFrom ?? ""} className="admin-filter-input" />
+        </FilterField>
+        <FilterField label="To (Form Date)">
+          <input type="date" name="dateTo" defaultValue={filterParams.dateTo ?? ""} className="admin-filter-input" />
+        </FilterField>
+        <FilterField label="Payee">
+          <input type="text" name="payee" defaultValue={filterParams.payee ?? ""} className="admin-filter-input" />
+        </FilterField>
+        <FilterField label="Department">
+          <input type="text" name="department" defaultValue={filterParams.department ?? ""} className="admin-filter-input" />
+        </FilterField>
+        <FilterField label="Payment Mode">
+          <select name="paymentMode" defaultValue={filterParams.paymentMode ?? ""} className="admin-filter-input">
+            <option value="">All</option>
+            <option value="NEFT">NEFT</option>
+            <option value="CASH">Cash</option>
+          </select>
+        </FilterField>
+        <FilterField label="Search (serial/bill/submitter)">
+          <input type="text" name="q" defaultValue={filterParams.q ?? ""} className="admin-filter-input" />
+        </FilterField>
+        <div className="col-span-2 flex items-end gap-2 sm:col-span-4 lg:col-span-7">
+          <button
+            type="submit"
+            className="rounded-md bg-brand px-4 py-2 text-sm font-medium text-white hover:bg-brand/90"
+          >
+            Apply filters
+          </button>
+          <Link href="/admin/submissions" className="rounded-md border border-gray-300 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50">
+            Clear
+          </Link>
+        </div>
+      </form>
+
+      {tab === "verified_ready_payment" && (needsPayableCount > 0 || needsPayableFilter) ? (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
+          <p><strong>{needsPayableCount}</strong> item{needsPayableCount === 1 ? " has" : "s have"} no payable calculation. Bulk payment will use the Basic amount with no deductions.</p>
+          <Link href={needsPayableHref(!needsPayableFilter)} className={`rounded-md border px-3 py-1.5 text-sm font-medium ${needsPayableFilter ? "border-brand bg-brand text-white" : "border-sky-300 bg-white text-sky-900 hover:bg-sky-100"}`}>
+            {needsPayableFilter ? "Show all Verified" : "Needs payable calculation"}
+          </Link>
+        </div>
+      ) : null}
+      {(() => {
+        const table = (
+      <div className="overflow-x-auto rounded-md border border-gray-200">
+        <table className="w-full min-w-[900px] text-left text-sm">
+          <thead className="border-b border-gray-200 bg-gray-50 text-xs uppercase tracking-wide text-gray-500">
+            <tr>
+              {bulkAction ? <th className="w-10 px-4 py-3"><BulkSelectAll /></th> : null}
+              <th className="px-4 py-3"><SortHeader label="Reference No." column="serialNo" searchParams={sp} currentSort={sort} currentDir={dir} /></th>
+              <th className="px-4 py-3"><SortHeader label="Form Date" column="formDate" searchParams={sp} currentSort={sort} currentDir={dir} /></th>
+              <th className="px-4 py-3"><SortHeader label="Payee" column="payeeName" searchParams={sp} currentSort={sort} currentDir={dir} /></th>
+              <th className="px-4 py-3 text-right"><SortHeader label="Amount" column="amount" searchParams={sp} currentSort={sort} currentDir={dir} /></th>
+              <th className="px-4 py-3"><SortHeader label="Mode" column="paymentMode" searchParams={sp} currentSort={sort} currentDir={dir} /></th>
+              <th className="px-4 py-3"><SortHeader label="Submitted By" column="submittedByName" searchParams={sp} currentSort={sort} currentDir={dir} /></th>
+              <th className="px-4 py-3"><SortHeader label="Department" column="submittedByDepartment" searchParams={sp} currentSort={sort} currentDir={dir} /></th>
+              <th className="px-4 py-3"><SortHeader label="Status" column="status" searchParams={sp} currentSort={sort} currentDir={dir} /></th>
+              {tab === "sent_back" || tab === "rejected" ? <th className="px-4 py-3">{tab === "rejected" ? "Rejected By / When" : "Remarks"}</th> : null}
+              {tab === "rejected" ? <th className="px-4 py-3">Remarks</th> : null}
+              <th className="px-4 py-3">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 ? (
+              <tr>
+                <td colSpan={columnCount} className="px-4 py-8 text-center text-gray-500">
+                  No submissions match these filters.
+                </td>
+              </tr>
+            ) : (
+              rows.map((row, index) => {
+                const sendBack = sentBackStatus(row.sentBackAt, row.editTokenExpiresAt);
+                const typeLabel = submissionTypeLabelFor(row.paymentMode as PaymentMode, row.isAdvance);
+                const previousRow = rows[index - 1];
+                const previousTypeLabel = previousRow
+                  ? submissionTypeLabelFor(previousRow.paymentMode as PaymentMode, previousRow.isAdvance)
+                  : null;
+                return (
+                <Fragment key={row.id}>
+                {typeLabel !== previousTypeLabel ? (
+                  <tr className="border-y border-gray-200 bg-brand/5">
+                    <td colSpan={columnCount} className="px-4 py-2 text-xs font-semibold uppercase tracking-wide text-brand">
+                      {typeLabel}
+                    </td>
+                  </tr>
+                ) : null}
+                <tr className={`border-b border-gray-100 last:border-0 hover:bg-gray-50 ${tab === "sent_back" && sendBack?.isExpired ? "bg-red-50/70" : tab === "sent_back" && sendBack?.isStale ? "bg-amber-50/70" : ""}`}>
+                  {bulkAction ? <td className="px-4 py-3 align-top"><BulkRowCheckbox id={row.id} /></td> : null}
+                  <td className="whitespace-nowrap px-4 py-3 font-medium text-brand">
+                    <div>{displayNoFor(
+                        row.paymentMode as PaymentMode,
+                        row.serialNo,
+                        row.cashVoucherNo,
+                        row.isAdvance,
+                        row.advanceNo,
+                      )}</div>
+                    <span className="mt-1 inline-flex rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-normal text-gray-600">
+                      {typeLabel}
+                    </span>
+                  </td>
+                  <td className="whitespace-nowrap px-4 py-3">{formatDateOnly(row.formDate)}</td>
+                  <td className="px-4 py-3">
+                    <div className="flex flex-col items-start gap-1">
+                      <span>{row.payeeName}</span>
+                      <BankDetailsMismatchBadge bankDetailsMismatch={row.bankDetailsMismatch} />
+                    </div>
+                  </td>
+                  <td className="whitespace-nowrap px-4 py-3 text-right">₹ {formatAmount(row.amount)}</td>
+                  <td className="whitespace-nowrap px-4 py-3">
+                    {row.paymentMode}
+                    {row.isAdvance ? " (Advance)" : ""}
+                  </td>
+                  <td className="px-4 py-3">{row.submittedByName}</td>
+                  <td className="px-4 py-3">{row.submittedByDepartment}</td>
+                  <td className="px-4 py-3">
+                    <div className="flex flex-col items-start gap-2">
+                      <StageBadge
+                        stage={pipelineStageFor({
+                          status: row.status,
+                          approvedAt: row.authorityApprovedAt,
+                          financeReceivedAt: row.financeReceivedAt,
+                          verifiedAt: row.verifiedAt,
+                          paymentDoneAt: row.paymentDoneAt,
+                          paymentMode: row.paymentMode,
+                          totalPaid: row.totalPaid,
+                          isAdvance: row.isAdvance,
+                        })}
+                      />
+                      {tab === "verified_ready_payment" && !payableIsSet(row) ? (
+                        <span className="text-xs text-gray-600">
+                          {payableNotSetLabel(row)}.{" "}
+                          <Link href={`/admin/advice/${row.id}`} className="font-medium underline">Open to set</Link>
+                        </span>
+                      ) : null}
+                      {tab === "sent_back" ? <SentBackIndicators sentBackAt={row.sentBackAt} editTokenExpiresAt={row.editTokenExpiresAt} /> : null}
+                    </div>
+                  </td>
+                  {tab === "sent_back" ? (
+                    <td className="max-w-[240px] truncate px-4 py-3" title={row.adminRemarks ?? ""}>
+                      {row.adminRemarks ?? "-"}
+                    </td>
+                  ) : null}
+                  {tab === "rejected" ? <td className="px-4 py-3"><div>{row.rejectedBy ?? "-"}</div><div className="text-xs text-gray-500">{row.rejectedAt ? formatIstDate(row.rejectedAt) : "-"}</div></td> : null}
+                  {tab === "rejected" ? <td className="max-w-[260px] whitespace-pre-wrap px-4 py-3">{row.rejectionRemarks ?? "-"}</td> : null}
+                  <td className="whitespace-nowrap px-4 py-3">
+                    <Link href={`/admin/advice/${row.id}`} className="font-medium text-brand hover:underline">
+                      View
+                    </Link>
+                  </td>
+                </tr>
+                </Fragment>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+        );
+        // Bulk actions only on the tabs where the next step is valid (see
+        // lib/advice/bulk-finance-actions.ts BULK_ACTION_TABS).
+        return bulkAction && session ? (
+          <BulkFinanceProvider
+            action={bulkAction}
+            rows={rows.map((row): BulkRow => ({
+              id: row.id,
+              reference: displayNoFor(row.paymentMode as PaymentMode, row.serialNo, row.cashVoucherNo, row.isAdvance, row.advanceNo),
+              payeeName: row.payeeName,
+              amount: row.amount,
+              paymentMode: row.paymentMode as "NEFT" | "CASH",
+              isAdvance: row.isAdvance,
+              payableAmount: row.payableAmount,
+              billPassedFor: row.billPassedFor,
+              totalPaid: row.totalPaid,
+              basicAmount: row.basicAmount,
+              gstAmount: row.gstAmount,
+              href: `/admin/advice/${row.id}`,
+              selectable: bulkAction !== "payment" || ownsSubmissionType(session.roles, row.paymentMode as "NEFT" | "CASH"),
+            }))}
+          >
+            {table}
+          </BulkFinanceProvider>
+        ) : table;
+      })()}
+
+      <div className="flex items-center justify-between text-sm text-gray-600">
+        <span>
+          Page {page} of {totalPages}
+        </span>
+        <div className="flex gap-2">
+          <Link
+            aria-disabled={page <= 1}
+            href={queryString(sp, { page: String(Math.max(1, page - 1)) })}
+            className={`rounded-md border border-gray-300 px-3 py-1.5 ${page <= 1 ? "pointer-events-none opacity-40" : "hover:bg-gray-50"}`}
+          >
+            Previous
+          </Link>
+          <Link
+            aria-disabled={page >= totalPages}
+            href={queryString(sp, { page: String(Math.min(totalPages, page + 1)) })}
+            className={`rounded-md border border-gray-300 px-3 py-1.5 ${page >= totalPages ? "pointer-events-none opacity-40" : "hover:bg-gray-50"}`}
+          >
+            Next
+          </Link>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FilterField({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label className="flex flex-col gap-1 text-xs font-medium text-gray-600">
+      {label}
+      {children}
+    </label>
+  );
+}
+
+function TabLink({
+  label,
+  tab,
+  activeTab,
+  count,
+  searchParams,
+}: {
+  label: string;
+  tab: AdminTab;
+  activeTab: AdminTab;
+  count: number | null;
+  searchParams: SearchParamsRecord;
+}) {
+  const isActive = tab === activeTab;
+  // "All" has no single stage/color of its own — keeps the original
+  // neutral navy treatment. Every other tab is colored by the exact stage
+  // it represents (STAGE_FOR_TAB), the same colors as that stage's badge.
+  const style = tab === "all" ? null : STAGE_STYLE[STAGE_FOR_TAB[tab]];
+  const activeClasses = style ? style.tabActive : "border-brand bg-brand text-white";
+  const inactiveClasses = style
+    ? style.tabInactive
+    : "border-gray-300 bg-white text-gray-600 hover:border-brand hover:text-brand";
+  return (
+    <Link
+      href={queryString(searchParams, { tab, page: undefined })}
+      className={`rounded-md border px-4 py-2 text-sm font-medium ${isActive ? activeClasses : inactiveClasses}`}
+    >
+      {label}
+      {count !== null ? ` (${count})` : ""}
+    </Link>
+  );
+}

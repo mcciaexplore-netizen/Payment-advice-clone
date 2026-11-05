@@ -1,0 +1,120 @@
+import fs from "node:fs";
+import path from "node:path";
+import { describe, expect, it } from "vitest";
+
+describe("Team Dashboard scoped views", () => {
+  const source = fs.readFileSync(path.join(process.cwd(), "app/authority/page.tsx"), "utf8");
+
+  it("filters Branch and Department grants against their snapshot columns, case-insensitively", () => {
+    expect(source).toContain("caseInsensitiveEq(paymentAdvices.branch, activeGrant.scopeValue!)");
+    expect(source).toContain("caseInsensitiveEq(paymentAdvices.submittedByDepartment, activeGrant.scopeValue!)");
+    expect(source).toContain("sql`lower(${column}) = lower(${value})`");
+  });
+
+  it("reuses one email predicate for My Submissions in every dashboard context", () => {
+    expect(source).toContain("const ownSubmissions = eq(paymentAdvices.submittedByEmail, account.email)");
+    expect(source).toContain('view === "my-submissions" ? ownSubmissions');
+  });
+
+  it("shows the sent-back edit link only in the submitter-scoped My Submissions view", () => {
+    expect(source).toContain("editToken: paymentAdvices.editToken, editTokenExpiresAt: paymentAdvices.editTokenExpiresAt");
+    expect(source).toContain('{view === "my-submissions" ? <div className="mt-2"><SubmitterEditAction');
+  });
+
+  it("SELF and CASH_RECEIPT (2026-10-07) are both restricted grants, forced into My Submissions/My Cash Receipts only, never Team Submissions", () => {
+    expect(source).toContain('const isRestrictedGrant = activeGrant.role === "SELF" || activeGrant.role === "CASH_RECEIPT"');
+    expect(source).toMatch(/activeGrant\.role === "SELF" \|\| activeGrant\.role === "CASH_RECEIPT"\s+\? ownSubmissions/);
+    expect(source).toContain('params.view === "cash-receipts" && canSeeCashReceiptsTab ? "cash-receipts"');
+    expect(source).toContain('isRestrictedGrant || params.view === "my-submissions" ? "my-submissions"');
+    expect(source).not.toContain('activeGrant.role === "SELF"\n        ? caseInsensitiveEq');
+  });
+
+  it("CASH_RECEIPT only becomes its own dashboard grant when the account does not also hold BRANCH, so BRANCH holders see no redundant entry", () => {
+    expect(source).toContain('const holdsBranchGrant = roleRows.some((row) => row.role === "BRANCH" && Boolean(row.scopeValue))');
+    expect(source).toContain('row.role === "CASH_RECEIPT" && Boolean(row.scopeValue) && !holdsBranchGrant && !holdsSelfGrant');
+  });
+
+  it("SELF + CASH_RECEIPT is one tab bar (My Submissions | My Cash Receipts), never a Branch or second role entry, and SELF without CASH_RECEIPT gets no Cash Receipts tab", () => {
+    expect(source).toContain('const holdsCashReceiptGrant = roleRows.some((row) => row.role === "CASH_RECEIPT" && Boolean(row.scopeValue))');
+    expect(source).toContain('(activeGrant.role === "SELF" && holdsCashReceiptGrant)');
+    expect(source).toContain('{canSeeCashReceiptsTab ? <Tab href={`/authority?role=${activeGrant.role}&view=cash-receipts`} active={false}>My Cash Receipts</Tab> : null}');
+  });
+
+  it("Cash Receipts tab is offered to BRANCH grants (unchanged) and to restricted (SELF/CASH_RECEIPT) grants as My Cash Receipts, and is a fully separate query path scoped to the signed-in issuer, not a filter layered on the Team Submissions query", () => {
+    expect(source).toContain('const isBranchGrant = activeGrant.role === "BRANCH"');
+    expect(source).toContain('const canSeeCashReceiptsTab = isModuleEnabled("cashReceipt") && (isBranchGrant || activeGrant.role === "CASH_RECEIPT" || (activeGrant.role === "SELF" && holdsCashReceiptGrant))');
+    expect(source).toContain('if (view === "cash-receipts")');
+    expect(source).toContain("return loadCashReceiptsTab(activeGrant, grants, session.adminUserId, isRestrictedGrant, params)");
+    expect(source).toContain("eq(cashReceipts.issuedByUserId, adminUserId),");
+    expect(source).toContain('isRestrictedGrant ? null : <Tab href={`/authority?role=${activeGrant.role}`} active={false}>Team Submissions</Tab>');
+    expect(source).toContain('{isRestrictedGrant ? "My Cash Receipts" : "Cash Receipts"}');
+  });
+
+  it("My Cash Receipts filters to the report bar's range (default today, IST) using the same parser as the report download", () => {
+    expect(source).toContain("const parsedRange = parseReportRange(");
+    expect(source).toContain("gte(cashReceipts.receiptDate, range.from)");
+    expect(source).toContain("lte(cashReceipts.receiptDate, range.to)");
+    expect(source).toContain('filterParams={{ role: activeGrant.role, view: "cash-receipts" }}');
+  });
+
+  it("keeps Team Submissions read-only while Authority rows retain View actions", () => {
+    expect(source).toContain('isAuthority && view === "pending"');
+    expect(source).toContain('<ViewLink adviceId={row.id} from="pending" />');
+    expect(source).not.toContain("AuthorityQueueActions");
+  });
+
+  it("offers type-correct UUID PDF downloads, with attachment buttons, in My Submissions and Team Submissions only", () => {
+    expect(source).toContain('const showDownloads = view === "my-submissions" || view === "team-submissions"');
+    expect(source).toContain('{showDownloads ? <th className="p-3">Download</th> : null}');
+    expect(source).toContain("pdfHref={submissionPdfHref(row)} pdfLabel={submissionPdfLabel(row)}");
+  });
+
+  it("routes only the linked DG authority record to the executive dashboard", () => {
+    expect(source).toContain('isExecutiveAuthority(authorityRows[0]?.authorityName)');
+    expect(source).toContain('if (isDg && (!params.view || params.view === "executive")) return loadDgExecutiveDashboard()');
+  });
+});
+
+describe("DG Phase 1 summary", () => {
+  const dg = fs.readFileSync(path.join(process.cwd(), "components/admin/DgExecutiveDashboard.tsx"), "utf8");
+  const admin = fs.readFileSync(path.join(process.cwd(), "app/admin/page.tsx"), "utf8");
+  const metrics = fs.readFileSync(path.join(process.cwd(), "lib/advice/dg-dashboard.ts"), "utf8");
+
+  it("shows four executive cards and merges exactly the five requested Finance stages", () => {
+    expect(dg).toContain('label: "In Finance Processing"');
+    expect(dg.match(/tab: "/g)).toHaveLength(4);
+    expect(metrics).toContain('"received_in_process"');
+    expect(metrics).toContain('"verified_ready_payment"');
+    expect(metrics).toContain('"partial_payment_done"');
+    expect(metrics).toContain('"fully_payment_settled"');
+    expect(metrics).toContain('"payment_done"');
+  });
+
+  it("leaves Finance Admin on the existing nine-card summary", () => {
+    expect(admin).toContain("PIPELINE_SUMMARY_STAGES.map");
+    expect(admin).toContain("<PipelineSummary");
+    expect(admin).not.toContain("DgExecutiveDashboard");
+    expect(admin).not.toContain("finance_processing");
+  });
+});
+
+describe("separate public login entry points", () => {
+  const menu = fs.readFileSync(path.join(process.cwd(), "components/public/PublicLoginMenu.tsx"), "utf8");
+  const authorityLogin = fs.readFileSync(path.join(process.cwd(), "app/authority/login/page.tsx"), "utf8");
+  const teamLogin = fs.readFileSync(path.join(process.cwd(), "app/team/login/page.tsx"), "utf8");
+
+  it("offers Finance, Authority, and Team Dashboard logins", () => {
+    expect(menu).toContain('title="Finance Admin Login"');
+    expect(menu).toContain('href="/authority/login"');
+    expect(menu).toContain('title="Authority Login"');
+    expect(menu).toContain('href="/team/login"');
+    expect(menu).toContain('title="Team Dashboard Login"');
+  });
+
+  it("keeps Authority and Team credentials on distinct endpoints", () => {
+    expect(authorityLogin).toContain('title="Authority Recommendations"');
+    expect(authorityLogin).toContain('endpoint="/api/authority/login"');
+    expect(teamLogin).toContain('title="Team Dashboard"');
+    expect(teamLogin).toContain('endpoint="/api/team/login"');
+  });
+});

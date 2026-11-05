@@ -1,0 +1,71 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files — .env.example is a template with no real secrets and
+# is meant to be committed; everything else stays local-only
+.env*
+!.env.example
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# scratch PDF output from scripts/render-test-pdf.tsx
+scripts/test-output.pdf
+scripts/cash-voucher-test-output.pdf
+
+# output of scripts/import-master-data.ts — may contain real staff/vendor
+# names, not meant to be committed
+import-report.md
+
+# the master data source file itself — contains real staff names, emails
+# and vendor data
+Master*FILE*AI.xlsx
+
+# output of scripts/seed-admin-users.ts — plaintext generated passwords,
+# shown once, never meant to be committed
+scripts/admin-users-report.md
+scripts/team-dashboard-users-report.md
+
+# local safety exports made before production data maintenance
+.local-backups/
+
+# Local development Cash Receipt data (not shared with the production app)
+.local-cash-receipts.json
+.local-cash-receipt-users.json
+
+# internal planning/audit notes (reference the source organisation; keep local)
+/AUDIT_REPORT.md
+/CLONE_PLAN.md

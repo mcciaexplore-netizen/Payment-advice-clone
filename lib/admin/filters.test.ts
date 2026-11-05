@@ -1,0 +1,212 @@
+import { SQL } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
+import { describe, expect, it } from "vitest";
+import { ADMIN_TABS, buildAdminListOrderBy, buildAdviceWhere, buildTabCondition, isAdminTab } from "./filters";
+
+/** Drizzle SQL condition objects are circular (they reference the table)
+ * and have no useful toString(), so the only reliable way to inspect what
+ * a condition actually filters on is to walk queryChunks for the literal
+ * values bound as query params (e.g. 'SUBMITTED' / 'APPROVED'). */
+function extractBoundParams(chunk: unknown, out: unknown[] = []): unknown[] {
+  if (chunk == null) return out;
+  if (Array.isArray(chunk)) {
+    for (const c of chunk) extractBoundParams(c, out);
+    return out;
+  }
+  const obj = chunk as { value?: unknown; constructor?: { name?: string }; queryChunks?: unknown };
+  if (obj.constructor?.name === "Param" && obj.value !== undefined) out.push(obj.value);
+  if (obj.queryChunks) extractBoundParams(obj.queryChunks, out);
+  return out;
+}
+
+function extractColumnNames(chunk: unknown, out = new Set<string>(), seen = new Set<object>()) {
+  if (!chunk || typeof chunk !== "object") return out;
+  if (seen.has(chunk as object)) return out;
+  seen.add(chunk as object);
+  if (Array.isArray(chunk)) {
+    for (const child of chunk) extractColumnNames(child, out, seen);
+    return out;
+  }
+  const record = chunk as Record<string, unknown>;
+  if (typeof record.name === "string") out.add(record.name);
+  for (const value of Object.values(record)) extractColumnNames(value, out, seen);
+  return out;
+}
+
+describe("isAdminTab", () => {
+  it("accepts every known pipeline-stage tab value", () => {
+    for (const tab of ADMIN_TABS) {
+      expect(isAdminTab(tab)).toBe(true);
+    }
+  });
+
+  it("rejects anything else, including undefined/empty and the retired 'ready_finance' name", () => {
+    expect(isAdminTab(undefined)).toBe(false);
+    expect(isAdminTab(null)).toBe(false);
+    expect(isAdminTab("")).toBe(false);
+    expect(isAdminTab("approved")).toBe(false);
+    expect(isAdminTab("ready_finance")).toBe(false);
+  });
+});
+
+describe("buildTabCondition", () => {
+  it("imposes no extra condition for 'all', matching the pre-existing unfiltered list", () => {
+    expect(buildTabCondition("all")).toBeUndefined();
+  });
+
+  it("produces a real, distinct SQL condition for each pipeline-stage tab", () => {
+    const stageTabs = ADMIN_TABS.filter((t) => t !== "all");
+    const conditions = stageTabs.map((tab) => buildTabCondition(tab));
+    for (const condition of conditions) {
+      expect(condition).toBeInstanceOf(SQL);
+    }
+    // Every stage tab's condition object is distinct — no two stages
+    // silently collapse onto the same SQL (which would show the same rows
+    // in two different tabs).
+    const unique = new Set(conditions);
+    expect(unique.size).toBe(conditions.length);
+  });
+
+  it("keys 'payment_done' on status APPROVED AND payment_mode CASH — Cash's tab, unaffected by NEFT's multi-part model", () => {
+    // The other four stage tabs all imply status SUBMITTED; once Payment
+    // Done fires, status flips to APPROVED, so this one has to filter on a
+    // different status value — a regression guard against it silently
+    // becoming "status SUBMITTED && paymentDoneAt set" (which would always
+    // be empty, since Payment Done always flips status to APPROVED in the
+    // same write). Also scoped to CASH so NEFT's fully-settled rows land in
+    // "fully_payment_settled" instead — see the project notes.
+    const params = extractBoundParams(buildTabCondition("payment_done"));
+    expect(params).toContain("APPROVED");
+    expect(params).toContain("CASH");
+    expect(params).not.toContain("SUBMITTED");
+    expect(params).not.toContain("NEFT");
+  });
+
+  it("keys 'fully_payment_settled' on status APPROVED AND payment_mode NEFT", () => {
+    const params = extractBoundParams(buildTabCondition("fully_payment_settled"));
+    expect(params).toContain("APPROVED");
+    expect(params).toContain("NEFT");
+    expect(params).not.toContain("CASH");
+  });
+
+  it("keys 'partial_payment_done' on status SUBMITTED AND payment_mode NEFT", () => {
+    const params = extractBoundParams(buildTabCondition("partial_payment_done"));
+    expect(params).toContain("SUBMITTED");
+    expect(params).toContain("NEFT");
+    expect(params).not.toContain("CASH");
+  });
+
+  it("keys the other stage tabs on status SUBMITTED", () => {
+    for (const tab of [
+      "waiting_authority",
+      "awaiting_finance",
+      "advance_payment",
+      "received_in_process",
+      "verified_ready_payment",
+      "partial_payment_done",
+    ] as const) {
+      expect(extractBoundParams(buildTabCondition(tab))).toContain("SUBMITTED");
+    }
+  });
+
+  it("'verified_ready_payment' also requires total_paid = 0, so a NEFT row with a partial payment recorded falls out into 'partial_payment_done' instead", () => {
+    // Cash rows never write to total_paid (always "0.00"), so this
+    // condition is a no-op for them — a regression guard, not a behavior
+    // change for Cash.
+    expect(extractBoundParams(buildTabCondition("verified_ready_payment"))).toContain("0");
+  });
+
+  it("keys 'sent_back' on status SENT_BACK, not SUBMITTED or APPROVED", () => {
+    expect(extractBoundParams(buildTabCondition("sent_back"))).toContain("SENT_BACK");
+    expect(extractBoundParams(buildTabCondition("sent_back"))).not.toContain("SUBMITTED");
+    expect(extractBoundParams(buildTabCondition("sent_back"))).not.toContain("APPROVED");
+  });
+
+  it("isolates permanently rejected rows in their own tab", () => {
+    expect(extractBoundParams(buildTabCondition("rejected"))).toContain("REJECTED");
+    for (const tab of ADMIN_TABS.filter((candidate) => !["rejected", "all"].includes(candidate))) {
+      expect(extractBoundParams(buildTabCondition(tab))).not.toContain("REJECTED");
+    }
+  });
+
+  it("'advance_payment' uses the same underlying condition as 'awaiting_finance', just also requiring is_advance = true", () => {
+    const advanceParams = extractBoundParams(buildTabCondition("advance_payment"));
+    expect(advanceParams).toContain("SUBMITTED");
+    expect(advanceParams).toContain(true);
+    expect(advanceParams).not.toContain(false);
+  });
+
+  it("'awaiting_finance' now also requires is_advance = false, so an approved advance never lands in both tabs", () => {
+    const awaitingFinanceParams = extractBoundParams(buildTabCondition("awaiting_finance"));
+    expect(awaitingFinanceParams).toContain("SUBMITTED");
+    expect(awaitingFinanceParams).toContain(false);
+    expect(awaitingFinanceParams).not.toContain(true);
+  });
+
+  it("does not add an is_advance condition to any other stage tab — the split is only at the landing point", () => {
+    for (const tab of [
+      "waiting_authority",
+      "received_in_process",
+      "verified_ready_payment",
+      "partial_payment_done",
+      "fully_payment_settled",
+      "payment_done",
+      "sent_back",
+    ] as const) {
+      const params = extractBoundParams(buildTabCondition(tab));
+      expect(params).not.toContain(true);
+      expect(params).not.toContain(false);
+    }
+  });
+});
+
+describe("buildAdminListOrderBy", () => {
+  it("defaults Sent Back to oldest sent_back_at first", () => {
+    const order = buildAdminListOrderBy("sent_back");
+    expect(extractColumnNames(order)).toContain("sent_back_at");
+    expect(new PgDialect().sqlToQuery(order[1]).sql).toContain('"sent_back_at" asc');
+  });
+
+  it("preserves explicit sorting in Sent Back", () => {
+    expect(extractColumnNames(buildAdminListOrderBy("sent_back", "amount", "desc"))).toContain("amount");
+  });
+
+  it("groups independent reference series before sorting within each group", () => {
+    const order = buildAdminListOrderBy("all", "serialNo", "desc");
+    const dialect = new PgDialect();
+    expect(dialect.sqlToQuery(order[0]).sql).toContain("case");
+    expect(dialect.sqlToQuery(order[1]).sql).toContain('"advance_no"');
+    expect(dialect.sqlToQuery(order[1]).sql).toContain('"cash_voucher_no"');
+    expect(dialect.sqlToQuery(order[1]).sql).toContain("desc");
+  });
+});
+
+describe("buildAdviceWhere", () => {
+  // Column objects carry a circular reference back to their whole table, so
+  // extractColumnNames (used above for order-by clauses) would report every
+  // sibling column as "present" here too — not useful for a "does NOT
+  // reference this column" assertion. The rendered SQL text is unambiguous.
+  function sqlText(where: SQL | undefined) {
+    return new PgDialect().sqlToQuery(where!).sql;
+  }
+
+  it("'q' free-text search matches serial/bill number and submitter name/email, not payee", () => {
+    const sql = sqlText(buildAdviceWhere({ q: "test" }));
+    expect(sql).toContain('"serial_no"');
+    expect(sql).toContain('"bill_no"');
+    expect(sql).toContain('"submitted_by_name"');
+    expect(sql).toContain('"submitted_by_email"');
+    expect(sql).not.toContain('"payee_name"');
+  });
+
+  it("the dedicated 'payee' filter still matches payee_name, independent of 'q'", () => {
+    expect(sqlText(buildAdviceWhere({ payee: "Acme" }))).toContain('"payee_name"');
+  });
+
+  it("'q' and 'payee' can both apply at once without either overriding the other", () => {
+    const sql = sqlText(buildAdviceWhere({ q: "test", payee: "Acme" }));
+    expect(sql).toContain('"payee_name"');
+    expect(sql).toContain('"submitted_by_name"');
+    expect(sql).toContain('"submitted_by_email"');
+  });
+});

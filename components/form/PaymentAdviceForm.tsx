@@ -1,0 +1,1338 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useForm, useWatch, type FieldErrors } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { upload } from "@vercel/blob/client";
+import { Field } from "@/components/ui/Field";
+import { Input, Select, Textarea } from "@/components/ui/Input";
+import { VendorTypeahead, VendorSearchResult } from "@/components/form/VendorTypeahead";
+import { VendorRequestPanel } from "@/components/form/VendorRequestPanel";
+import { VendorRequestModal } from "@/components/form/VendorRequestModal";
+import { VendorBankAccountFields } from "@/components/form/VendorBankAccountFields";
+import { StaffNameTypeahead, StaffSearchResult } from "@/components/form/StaffNameTypeahead";
+import { RecommendingAuthorityField } from "@/components/form/RecommendingAuthorityField";
+import { FileUploadSlot } from "@/components/form/FileUploadSlot";
+import { LineItemsField } from "@/components/form/LineItemsField";
+import { CashVoucherItemsField } from "@/components/form/CashVoucherItemsField";
+import { storeSubmissionSummary } from "@/lib/submission-summary";
+import { bankDetailsMismatch, invoiceBeneficiaryName } from "@/lib/invoice-autofill";
+import { resolveAutoFillEmail } from "@/lib/form/staff-email-autofill";
+import { resolveSourceFieldAutoFill } from "@/lib/form/source-field-autofill";
+import {
+  safeUploadFileName,
+  type UploadedAttachment,
+} from "@/lib/attachments/client-upload";
+import { ATTACHMENT_SIZE_ERROR, readSubmitResponse } from "@/lib/form/submit-response";
+import { todayInIst } from "@/lib/date-time";
+import {
+  paymentAdviceFormSchema,
+  PaymentAdviceFormInput,
+  PaymentAdviceFormValues,
+  MAX_OTHER_ATTACHMENTS,
+  DocType,
+  calculateCashVoucherTotal,
+  BRANCH_OPTIONS,
+  DEPARTMENT_OPTIONS,
+} from "@/lib/validation/payment-advice";
+import { HAS_DEPARTMENTS, HAS_SINGLE_BRANCH } from "@/lib/config";
+
+type RecommendingAuthority = {
+  id: string;
+  authorityName: string;
+};
+
+const today = todayInIst();
+
+export function PaymentAdviceForm({
+  mode,
+  recommendingAuthorities,
+  prefill,
+  editToken,
+  existingAttachments,
+  existingCashVoucherItemAttachments,
+}: {
+  /** Fixed per page, never toggled at runtime — "standard" is the plain
+   * Dedicated public document route, or the existing Advance route. All render this
+   * same component so the shared field logic (submitter/payee auto-fill,
+   * Particulars, attachments) only ever lives in one place; only which
+   * sections render, and whether isAdvance itself is true, differ. */
+  mode: "payment-advice" | "cash-voucher" | "advance";
+  recommendingAuthorities: RecommendingAuthority[];
+  /** When set, this is a resubmission via /edit/[token] — pre-fill everything. */
+  prefill?: Partial<PaymentAdviceFormInput> & { formDate?: string };
+  editToken?: string;
+  /** Attachments already on file from before send-back, keyed by doc type —
+   * only relevant in edit/resubmit mode. Uploading a new file for a doc type
+   * replaces these; leaving the slot empty keeps them. */
+  existingAttachments?: Partial<Record<DocType, string[]>>;
+  /** Existing per-expense bill filename keyed by cash_voucher_items.id. */
+  existingCashVoucherItemAttachments?: Record<string, string>;
+}) {
+  const isAdvance = mode === "advance";
+  const isCashVoucher = mode === "cash-voucher";
+  const router = useRouter();
+  const [submitting, setSubmitting] = useState(false);
+  const [uploadingAttachments, setUploadingAttachments] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+
+  const [taxInvoice, setTaxInvoice] = useState<File[]>([]);
+  // A Tax Invoice is uploaded to Blob only when the submitter explicitly
+  // asks Gemini to read it. The same private Blob is then reused by final
+  // submission, avoiding a second upload and keeping invoice bytes out of
+  // the serverless form request.
+  const [autoFillInvoiceUpload, setAutoFillInvoiceUpload] = useState<UploadedAttachment | null>(null);
+  const [extractingInvoice, setExtractingInvoice] = useState(false);
+  const [hasInvoiceAutoFill, setHasInvoiceAutoFill] = useState(false);
+  const [invoiceAutoFillError, setInvoiceAutoFillError] = useState<string | null>(null);
+  // The invoice's own printed bank details (if extracted), kept only to
+  // compare against whatever the vendor-bank-accounts system record ends up
+  // filling in — see applyVendorBankAccount below. Cleared whenever the Tax
+  // Invoice file changes so a stale comparison can't leak across invoices.
+  const [invoiceExtractedBank, setInvoiceExtractedBank] = useState<{
+    bankAccountNo: string | null;
+    bankIfsc: string | null;
+  } | null>(null);
+  const [vendorRequestMsmeDocument, setVendorRequestMsmeDocument] = useState<File[]>([]);
+  const [vendorRequestDocumentType, setVendorRequestDocumentType] = useState<
+    "UDYAM_CERTIFICATE" | "NON_MSME_DECLARATION"
+  >("UDYAM_CERTIFICATE");
+  // Set once "Send Email" succeeds on the request panel - carried through
+  // to the server at final PA submission (vendor_requests.msme_email_sent_at
+  // etc.), same pattern as the MSME document's own Blob fields above.
+  const [vendorRequestMsmeEmailSentAt, setVendorRequestMsmeEmailSentAt] = useState<string | null>(null);
+  const [vendorRequestMsmeEmailMessageId, setVendorRequestMsmeEmailMessageId] = useState<string | null>(null);
+  // Controls only whether the "Request to add vendor" modal overlay is on
+  // screen - isNewVendorRequest (form state) is the separate, persistent
+  // "we're in new-vendor mode" flag. Closing the modal via "Done" leaves
+  // isNewVendorRequest true and shows the collapsed pending-approval summary
+  // below; every other close path (X, backdrop, Escape, "Back to vendor
+  // search instead") discards the whole request via cancelNewVendorRequest.
+  const [vendorRequestModalOpen, setVendorRequestModalOpen] = useState(false);
+  const [approvalBudget, setApprovalBudget] = useState<File[]>([]);
+  const [purchaseOrder, setPurchaseOrder] = useState<File[]>([]);
+  const [deliveryChallanFile, setDeliveryChallanFile] = useState<File[]>([]);
+  const [otherFiles, setOtherFiles] = useState<File[]>([]);
+  const [cashVoucherBillFiles, setCashVoucherBillFiles] = useState<Record<string, File[]>>({});
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const prefilledDepartment = prefill?.submittedByDepartment;
+  const prefilledDepartmentOption = prefilledDepartment
+    ? DEPARTMENT_OPTIONS.find((option) => option !== "OTHERS" && option === prefilledDepartment) ?? "OTHERS"
+    : undefined;
+
+  const {
+    register,
+    handleSubmit,
+    setValue,
+    getValues,
+    control,
+    formState: { errors },
+  } = useForm<PaymentAdviceFormInput, unknown, PaymentAdviceFormValues>({
+    resolver: zodResolver(paymentAdviceFormSchema),
+    defaultValues: {
+      submittedByDepartmentOption: prefilledDepartmentOption,
+      // One configured branch: the selector is hidden and the branch is implied.
+      branch: HAS_SINGLE_BRANCH ? BRANCH_OPTIONS[0] : undefined,
+      paymentMode: isCashVoucher ? "CASH" : "NEFT",
+      cashVoucherItems: isCashVoucher ? [{ clientKey: crypto.randomUUID(), billNo: "", billDate: undefined, description: "", amount: undefined as unknown as number }] : [],
+      isAdvance,
+      previousPendingAdvanceAmount: 0,
+      // Seeded directly here (not via a useEffect that appends when empty)
+      // since isAdvance is now fixed from the very first render for the
+      // dedicated /advance page — an effect-based "append if empty" runs
+      // during initial mount, which React Strict Mode's dev-only
+      // double-invocation would run twice against the same stale closure,
+      // silently seeding two rows instead of one.
+      advanceParticulars: isAdvance ? [{ description: "", amount: 0 }] : [],
+      ...prefill,
+      // Form Date is system-controlled for both new submissions and
+      // resubmissions. A historical prefill must never override today's IST
+      // date in the read-only field.
+      formDate: today,
+    },
+  });
+
+  const [matchedStaff, setMatchedStaff] = useState<StaffSearchResult | null>(null);
+  // Same "only react on an actual identity change" pattern
+  // RecommendingAuthorityField's lastStaffId ref already uses — onMatch can
+  // re-fire repeatedly for the *same* matched staff member (e.g. on every
+  // keystroke once an exact match is typed), and re-running the email
+  // auto-fill logic on those redundant calls would be harmless on its own,
+  // but tying the actual fill/clear decision to a real identity change
+  // keeps this in lockstep with how the Authority field behaves and makes
+  // the "did the match actually change" intent explicit here too.
+  const lastMatchedStaffIdRef = useRef<string | null>(null);
+  // Tracks whatever this logic itself last wrote into "Your Email" (or null
+  // if it never has) — lets resolveAutoFillEmail tell a stale auto-fill
+  // (safe to replace on the next match change) apart from a real manual
+  // edit or an /edit/[token] resubmit prefill (never touched).
+  const lastAutoFilledEmailRef = useRef<string | null>(null);
+
+  const paymentMode = useWatch({ control, name: "paymentMode" });
+  const hasBankDetailsMismatch = useWatch({ control, name: "bankDetailsMismatch" }) ?? false;
+  const payeeName = useWatch({ control, name: "payeeName" }) ?? "";
+  const vendorId = useWatch({ control, name: "vendorId" });
+  const isNewVendorRequest = useWatch({ control, name: "isNewVendorRequest" }) ?? false;
+  const vendorRequestVendorEmail = useWatch({ control, name: "vendorRequestVendorEmail" }) ?? "";
+  const vendorRequestMsmeStatus = useWatch({ control, name: "vendorRequestMsmeStatus" }) ?? "UNKNOWN";
+  const submittedByName = useWatch({ control, name: "submittedByName" }) ?? "";
+  const submittedByEmail = useWatch({ control, name: "submittedByEmail" }) ?? "";
+  const submittedByDepartmentOption = useWatch({ control, name: "submittedByDepartmentOption" });
+  const recommendingAuthorityId = useWatch({ control, name: "recommendingAuthorityId" }) ?? "";
+  const watchedCashVoucherItems = useWatch({ control, name: "cashVoucherItems" });
+  const cashVoucherItems = useMemo(
+    () => watchedCashVoucherItems ?? [],
+    [watchedCashVoucherItems],
+  );
+  const basicAmount = useWatch({ control, name: "basicAmount" });
+  const gstAmount = useWatch({ control, name: "gstAmount" });
+  const watchedAdvanceParticulars = useWatch({ control, name: "advanceParticulars" });
+  const advanceParticulars = useMemo(
+    () => watchedAdvanceParticulars ?? [],
+    [watchedAdvanceParticulars],
+  );
+  const previousPendingAdvanceAmount =
+    useWatch({ control, name: "previousPendingAdvanceAmount" }) ?? 0;
+  const attachmentGroups = useMemo(
+    () => [
+      { docType: "TAX_INVOICE" as const, files: taxInvoice },
+      { docType: "APPROVAL_BUDGET" as const, files: approvalBudget },
+      { docType: "PURCHASE_ORDER" as const, files: purchaseOrder },
+      { docType: "DELIVERY_CHALLAN" as const, files: deliveryChallanFile },
+      { docType: "OTHER" as const, files: otherFiles },
+    ],
+    [taxInvoice, approvalBudget, purchaseOrder, deliveryChallanFile, otherFiles],
+  );
+  const attachmentTotalBytes = attachmentGroups.reduce(
+    (total, group) => total + group.files.reduce((sum, file) => sum + file.size, 0),
+    0,
+  ) + Object.values(cashVoucherBillFiles).flat().reduce((sum, file) => sum + file.size, 0);
+
+  useEffect(() => {
+    if (isAdvance || paymentMode !== "CASH") return;
+    const completeItems = cashVoucherItems.filter(
+      (item) => Number.isFinite(item?.amount) && item.amount > 0,
+    );
+    setValue("amount", calculateCashVoucherTotal(completeItems), {
+      shouldValidate: false,
+    });
+  }, [cashVoucherItems, isAdvance, paymentMode, setValue]);
+
+  // Total (Rs.) is always Basic Amount + GST Amount for NEFT — auto-
+  // calculated, read-only, updates live as either field changes. Mirrors
+  // the Cash Voucher line-item total's existing useEffect pattern above.
+  const neftTotal =
+    (Number.isFinite(basicAmount) ? Number(basicAmount) : 0) +
+    (Number.isFinite(gstAmount) ? Number(gstAmount) : 0);
+  useEffect(() => {
+    if (isAdvance || paymentMode !== "NEFT") return;
+    setValue("amount", Math.round(neftTotal * 100) / 100, { shouldValidate: false });
+  }, [isAdvance, paymentMode, neftTotal, setValue]);
+
+  // Advance Payment's Particulars total — same live-summed-total mechanic
+  // as the Cash Voucher line items above. The first row is seeded via
+  // defaultValues (see above), and "Remove" is disabled at 1 remaining row,
+  // so this never needs to re-seed an empty array itself.
+  useEffect(() => {
+    if (!isAdvance) return;
+    const completeItems = advanceParticulars.filter(
+      (item) => Number.isFinite(item?.amount) && item.amount > 0,
+    );
+    setValue("amount", calculateCashVoucherTotal(completeItems), {
+      shouldValidate: false,
+    });
+  }, [advanceParticulars, isAdvance, setValue]);
+
+  // Advance Payment's payee IS the submitter — they're receiving the
+  // advance themselves, not paying a vendor — so the vendor typeahead is
+  // hidden and Payee Name/Email are instead auto-filled from Submitter
+  // Name/Email, using the same "only react on an actual source-value
+  // change, never fight the user" pattern as the staff-match email
+  // auto-fill below.
+  const lastAutoFilledPayeeNameRef = useRef<string | null>(null);
+  const lastAutoFilledPayeeEmailRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!isAdvance && !isCashVoucher) return;
+    const action = resolveSourceFieldAutoFill(
+      submittedByName,
+      getValues("payeeName") ?? "",
+      lastAutoFilledPayeeNameRef.current,
+    );
+    if (action.type === "fill") {
+      setValue("payeeName", action.value);
+      lastAutoFilledPayeeNameRef.current = action.value;
+    } else if (action.type === "clear") {
+      setValue("payeeName", "");
+      lastAutoFilledPayeeNameRef.current = null;
+    }
+  }, [isAdvance, isCashVoucher, submittedByName, getValues, setValue]);
+
+  useEffect(() => {
+    if (!isAdvance && !isCashVoucher) return;
+    const action = resolveSourceFieldAutoFill(
+      submittedByEmail,
+      getValues("payeeEmail") ?? "",
+      lastAutoFilledPayeeEmailRef.current,
+    );
+    if (action.type === "fill") {
+      setValue("payeeEmail", action.value);
+      lastAutoFilledPayeeEmailRef.current = action.value;
+    } else if (action.type === "clear") {
+      setValue("payeeEmail", "");
+      lastAutoFilledPayeeEmailRef.current = null;
+    }
+  }, [isAdvance, isCashVoucher, submittedByEmail, getValues, setValue]);
+
+  // Mirrors applyVendor's "fill only what's on file" pattern below, plus
+  // RecommendingAuthorityField's "only react when the matched identity
+  // actually changes" pattern above it. A stale auto-fill from a previous
+  // match is updated/cleared when the match changes to someone new; a real
+  // manual edit (or an /edit/[token] resubmit prefill) is never touched.
+  function handleStaffMatch(staff: StaffSearchResult | null) {
+    setMatchedStaff(staff);
+
+    const staffId = staff?.id ?? null;
+    if (staffId === lastMatchedStaffIdRef.current) return;
+    lastMatchedStaffIdRef.current = staffId;
+
+    const action = resolveAutoFillEmail(
+      staff,
+      getValues("submittedByEmail") ?? "",
+      lastAutoFilledEmailRef.current,
+    );
+    if (action.type === "fill") {
+      setValue("submittedByEmail", action.email);
+      lastAutoFilledEmailRef.current = action.email;
+    } else if (action.type === "clear") {
+      setValue("submittedByEmail", "");
+      lastAutoFilledEmailRef.current = null;
+    }
+  }
+
+  function applyVendor(vendor: VendorSearchResult) {
+    setValue("vendorId", vendor.id);
+    setValue("payeeName", vendor.companyName);
+    if (vendor.address) setValue("payeeAddress", vendor.address);
+    if (vendor.contactPerson) setValue("payeeContactPerson", vendor.contactPerson);
+    if (vendor.contactPhone) setValue("payeeContactPhone", vendor.contactPhone);
+    if (vendor.email) setValue("payeeEmail", vendor.email);
+    if (vendor.gstin) setValue("payeeGstin", vendor.gstin);
+    if (vendor.udyamNumber) setValue("payeeUdyamNumber", vendor.udyamNumber);
+  }
+
+  function handleTaxInvoiceChange(files: File[]) {
+    const priorUpload = autoFillInvoiceUpload;
+    setTaxInvoice(files);
+    setAutoFillInvoiceUpload(null);
+    setHasInvoiceAutoFill(false);
+    setInvoiceAutoFillError(null);
+    setInvoiceExtractedBank(null);
+    setValue("bankDetailsMismatch", false);
+    if (priorUpload) void cleanupPendingUploads([priorUpload]);
+  }
+
+  async function tryInvoiceAutoFill() {
+    const file = taxInvoice[0];
+    if (!file || isAdvance || isCashVoucher) return;
+
+    setExtractingInvoice(true);
+    setInvoiceAutoFillError(null);
+    try {
+      let uploaded = autoFillInvoiceUpload;
+      if (!uploaded) {
+        const uploadBatchId = crypto.randomUUID();
+        let blob: Awaited<ReturnType<typeof upload>>;
+        try {
+          blob = await upload(
+            `pending-uploads/${uploadBatchId}/TAX_INVOICE-${safeUploadFileName(file.name)}`,
+            file,
+            {
+              access: "private",
+              handleUploadUrl: "/api/attachments/upload",
+              multipart: file.size > 4 * 1024 * 1024,
+            },
+          );
+        } catch {
+          throw new Error("The tax invoice could not be uploaded for reading. Please try again, or fill the form manually.");
+        }
+        uploaded = {
+          docType: "TAX_INVOICE",
+          fileName: file.name,
+          blobPathname: blob.pathname,
+          blobUrl: blob.url,
+          sizeBytes: file.size,
+        };
+        setAutoFillInvoiceUpload(uploaded);
+      }
+
+      const response = await fetch("/api/invoice-autofill", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pathname: uploaded.blobPathname }),
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(payload?.error ?? "Invoice reading is temporarily unavailable. You can continue by filling the form manually.");
+      const autoFill = payload?.autoFill;
+      if (!autoFill) throw new Error(payload?.error ?? "We couldn't read any details from this file. Try a clearer PDF or image, or fill the form manually.");
+
+      let changed = false;
+      if (autoFill.billNo) {
+        setValue("billNo", autoFill.billNo, { shouldValidate: true });
+        changed = true;
+      }
+      if (autoFill.billDate) {
+        setValue("billDate", autoFill.billDate, { shouldValidate: true });
+        changed = true;
+      }
+      if (typeof autoFill.basicAmount === "number") {
+        setValue("basicAmount", autoFill.basicAmount, { shouldValidate: true });
+        changed = true;
+      }
+      if (typeof autoFill.gstAmount === "number") {
+        setValue("gstAmount", autoFill.gstAmount, { shouldValidate: true });
+        changed = true;
+      }
+      // The server returns a vendor only after a strict match against active
+      // canonical vendor rows. Raw invoice payee text never reaches this
+      // branch, so auto-fill cannot create or bypass the vendor dropdown.
+      if (autoFill.vendor) {
+        applyVendor(autoFill.vendor as VendorSearchResult);
+        changed = true;
+      }
+      // Bank details: the invoice's own printed bank details are only a
+      // fallback starting point, filled here as plain editable text — never
+      // a vendor-selection risk, since nothing here can pick a vendor.
+      // `VendorBankAccountFields` below watches `vendorId` (just set by
+      // applyVendor, if a vendor matched) and re-fetches on the next
+      // render, *after* this synchronous handler finishes: if the vendor
+      // turns out to have exactly one known account on file, that system
+      // record correctly overwrites these invoice-sourced values a moment
+      // later; if it has none, these stay; if it has several, the picker
+      // appears and — same as a manual edit — nothing here is touched
+      // until the submitter actively chooses an option.
+      if (autoFill.bankAccountNo || autoFill.bankIfsc) {
+        if (autoFill.bankAccountNo) setValue("bankAccountNo", autoFill.bankAccountNo, { shouldValidate: true });
+        if (autoFill.bankIfsc) setValue("bankIfsc", autoFill.bankIfsc, { shouldValidate: true });
+        // Only alongside printed bank details, and never over a typed value
+        // (see invoiceBeneficiaryName).
+        const beneficiaryName = invoiceBeneficiaryName(autoFill, getValues("beneficiaryName"));
+        if (beneficiaryName) setValue("beneficiaryName", beneficiaryName, { shouldValidate: true });
+        // Kept so applyVendorBankAccount (fired later by
+        // VendorBankAccountFields, if this invoice's vendor turns out to
+        // have a known system record) can compare against it and flag a
+        // contradiction for Finance — see that function below.
+        setInvoiceExtractedBank({
+          bankAccountNo: autoFill.bankAccountNo ?? null,
+          bankIfsc: autoFill.bankIfsc ?? null,
+        });
+        changed = true;
+      }
+      // Bank Name has no per-vendor system record to prefer over it (unlike
+      // account no./IFSC above) — just fill it directly when the invoice
+      // printed one, independent of whether account/IFSC were also found.
+      if (autoFill.bankName) {
+        setValue("bankName", autoFill.bankName, { shouldValidate: true });
+        changed = true;
+      }
+      if (changed) setHasInvoiceAutoFill(true);
+      else setInvoiceAutoFillError("No invoice details could be identified. Try a clearer PDF or image, or fill the form manually.");
+    } catch (error) {
+      setInvoiceAutoFillError(error instanceof Error ? error.message : "Invoice auto-fill is unavailable. Please fill the form manually.");
+    } finally {
+      setExtractingInvoice(false);
+    }
+  }
+
+  // Fired by VendorBankAccountFields — either a known account was applied
+  // (auto-filled, or the submitter picked one of several) or `null` for an
+  // explicit "None of these" manual-entry choice, which clears the fields
+  // the same way a genuinely new vendor with no history on file would.
+  function applyVendorBankAccount(account: { bankAccountNo: string; bankIfsc: string; beneficiaryName: string } | null) {
+    setValue("bankAccountNo", account?.bankAccountNo ?? "");
+    setValue("bankIfsc", account?.bankIfsc ?? "");
+    setValue("beneficiaryName", account?.beneficiaryName ?? "");
+    // The known system record always wins for what's actually saved above —
+    // but if it contradicts what the invoice itself printed, flag it for
+    // Finance rather than silently overwriting and saying nothing. Only
+    // meaningful when a real system account was just applied and this
+    // invoice actually extracted bank details to compare it against.
+    setValue(
+      "bankDetailsMismatch",
+      account && invoiceExtractedBank ? bankDetailsMismatch(account, invoiceExtractedBank) : false,
+    );
+  }
+
+  async function onSubmit(values: PaymentAdviceFormValues) {
+    setSubmitError(null);
+
+    // A Tax Invoice is mandatory for Payment Advice; Cash Voucher requires
+    // one per-expense bill below. Approval / Budget Letter is mandatory only
+    // for Advance Payment.
+    const hasTaxInvoice =
+      values.isAdvance || values.paymentMode === "CASH" ||
+      taxInvoice.length === 1 ||
+      (existingAttachments?.TAX_INVOICE?.length ?? 0) > 0;
+    const hasApprovalBudget = !values.isAdvance ||
+      approvalBudget.length === 1 || (existingAttachments?.APPROVAL_BUDGET?.length ?? 0) > 0;
+    const missingCashBill = values.paymentMode === "CASH" && !values.isAdvance
+      ? values.cashVoucherItems.find((item) =>
+          (cashVoucherBillFiles[item.clientKey]?.length ?? 0) !== 1 &&
+          !existingCashVoucherItemAttachments?.[item.id ?? item.clientKey],
+        )
+      : undefined;
+    if (!hasTaxInvoice || !hasApprovalBudget || missingCashBill) {
+      const message = missingCashBill
+        ? "Attach one Bill/Supplementary Document for every Cash Voucher expense."
+          : values.isAdvance
+          ? "Approval / Budget Letter is a mandatory attachment."
+          : "Tax Invoice / Supplementary Document is a mandatory attachment.";
+      setAttachmentError(message);
+      // This message is also shown at the top because the submit button is
+      // below Section 4. Previously we scrolled to the top while rendering
+      // the only error back in Section 4, making a valid click look inert.
+      setSubmitError(message);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
+    setAttachmentError(null);
+
+    const formData = new FormData();
+    for (const [key, value] of Object.entries(values)) {
+      if (value === undefined || value === null) continue;
+      if (key === "cashVoucherItems" || key === "advanceParticulars") continue;
+      formData.append(key, String(value));
+    }
+    formData.append("cashVoucherItems", JSON.stringify(values.cashVoucherItems));
+    formData.append("advanceParticulars", JSON.stringify(values.advanceParticulars));
+    if (editToken) formData.append("editToken", editToken);
+
+    setSubmitting(true);
+    const uploadedAttachments: UploadedAttachment[] = [];
+    let vendorRequestMsmeBlob: { blobPathname: string } | null = null;
+    try {
+      setUploadingAttachments(true);
+      const uploadBatchId = crypto.randomUUID();
+      for (const { docType, files } of attachmentGroups) {
+        for (const file of files) {
+          if (docType === "TAX_INVOICE" && autoFillInvoiceUpload) {
+            uploadedAttachments.push(autoFillInvoiceUpload);
+            continue;
+          }
+          const blob = await upload(
+            `pending-uploads/${uploadBatchId}/${docType}-${safeUploadFileName(file.name)}`,
+            file,
+            {
+              access: "private",
+              handleUploadUrl: "/api/attachments/upload",
+              multipart: file.size > 4 * 1024 * 1024,
+            },
+          );
+          uploadedAttachments.push({
+            docType,
+            fileName: file.name,
+            blobPathname: blob.pathname,
+            blobUrl: blob.url,
+            sizeBytes: file.size,
+          });
+        }
+      }
+      if (values.paymentMode === "CASH" && !values.isAdvance) {
+        for (const item of values.cashVoucherItems) {
+          const file = cashVoucherBillFiles[item.clientKey]?.[0];
+          if (!file) continue;
+          const blob = await upload(
+            `pending-uploads/${uploadBatchId}/CASH_VOUCHER_BILL-${safeUploadFileName(file.name)}`,
+            file,
+            {
+              access: "private",
+              handleUploadUrl: "/api/attachments/upload",
+              multipart: file.size > 4 * 1024 * 1024,
+            },
+          );
+          uploadedAttachments.push({
+            docType: "CASH_VOUCHER_BILL",
+            cashVoucherItemKey: item.clientKey,
+            fileName: file.name,
+            blobPathname: blob.pathname,
+            blobUrl: blob.url,
+            sizeBytes: file.size,
+          });
+        }
+      }
+      // Vendor request's optional MSME document - direct-to-Blob, same
+      // pattern as every other attachment, but not part of the shared
+      // attachments table/uploadedAttachments array (it belongs to the
+      // vendor_requests row, not to this payment_advices row's document
+      // set) - so it's tracked and appended separately.
+      if (values.isNewVendorRequest && vendorRequestMsmeDocument.length === 1) {
+        const file = vendorRequestMsmeDocument[0];
+        const blob = await upload(
+          `pending-uploads/${uploadBatchId}/VENDOR_REQUEST_MSME-${safeUploadFileName(file.name)}`,
+          file,
+          {
+            access: "private",
+            handleUploadUrl: "/api/attachments/upload",
+            multipart: file.size > 4 * 1024 * 1024,
+          },
+        );
+        vendorRequestMsmeBlob = { blobPathname: blob.pathname };
+        formData.append("vendorRequestMsmeDocumentUrl", blob.url);
+        formData.append("vendorRequestMsmeDocumentPathname", blob.pathname);
+        formData.append("vendorRequestMsmeDocumentFileName", file.name);
+        formData.append("vendorRequestMsmeDocumentSizeBytes", String(file.size));
+        formData.append("vendorRequestMsmeDocumentType", vendorRequestDocumentType);
+      }
+      if (values.isNewVendorRequest && vendorRequestMsmeEmailSentAt) {
+        formData.append("vendorRequestMsmeEmailSentAt", vendorRequestMsmeEmailSentAt);
+        if (vendorRequestMsmeEmailMessageId) {
+          formData.append("vendorRequestMsmeEmailMessageId", vendorRequestMsmeEmailMessageId);
+        }
+      }
+
+      setUploadingAttachments(false);
+      formData.append("uploadedAttachments", JSON.stringify(uploadedAttachments));
+
+      const res = await fetch(editToken ? `/api/edit/${editToken}` : "/api/submit", {
+        method: "POST",
+        body: formData,
+      });
+      const { data, sizeError } = await readSubmitResponse(res);
+      if (!res.ok) {
+        await cleanupPendingUploads(uploadedAttachments);
+        if (vendorRequestMsmeBlob) await cleanupPendingBlob(vendorRequestMsmeBlob.blobPathname);
+        setSubmitError(
+          sizeError
+            ? ATTACHMENT_SIZE_ERROR
+            : data.error ?? "Something went wrong while submitting. Please try again.",
+        );
+        window.scrollTo({ top: 0, behavior: "smooth" });
+        return;
+      }
+      storeSubmissionSummary({
+        id: data.id!,
+        serialNo: data.serialNo!,
+        cashVoucherNo: data.cashVoucherNo ?? null,
+        isAdvance: values.isAdvance,
+        advanceNo: data.advanceNo ?? null,
+        payeeName: values.payeeName,
+        amount: values.amount,
+        billNo: values.billNo ?? "",
+        paymentMode: values.paymentMode,
+        submittedByName: values.submittedByName,
+        submittedByDepartment: values.submittedByDepartment,
+        branch: values.branch,
+        natureOfExpenditure: values.isAdvance
+          ? values.purposeOfAdvance ?? ""
+          : values.paymentMode === "CASH"
+            ? values.cashVoucherItems.map((item) => item.description).join("; ")
+            : values.natureOfExpenditure ?? "",
+        authorityToken: data.authorityToken!,
+        authorityName: data.authorityName!,
+      });
+      router.push(`/submitted/${encodeURIComponent(data.serialNo!)}`);
+    } catch (error) {
+      await cleanupPendingUploads(uploadedAttachments);
+      if (vendorRequestMsmeBlob) await cleanupPendingBlob(vendorRequestMsmeBlob.blobPathname);
+      const message = error instanceof Error ? error.message : "";
+      setSubmitError(
+        /too large|size|413|maximum/i.test(message)
+          ? ATTACHMENT_SIZE_ERROR
+          : "Could not upload or submit your documents. Please check your connection and try again.",
+      );
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } finally {
+      setUploadingAttachments(false);
+      setSubmitting(false);
+    }
+  }
+
+  function onInvalid(formErrors: FieldErrors<PaymentAdviceFormInput>) {
+    // Vendor Name/Address/GSTIN/Email now live inside the "Request to add
+    // vendor" modal rather than inline, so if any of them fail validation
+    // on a submit attempt, reopen the modal - otherwise those errors would
+    // be set but invisible, since the fields they belong to aren't on screen.
+    // Also reopens on a raw-value presence check, not just formErrors: the
+    // vendor-email/address "required" rules live in this schema's
+    // superRefine, and a pre-existing, unrelated zod quirk (confirmed
+    // separately, not introduced here) skips superRefine entirely whenever
+    // an unrelated required enum elsewhere in the form - e.g. Branch or
+    // Department - is also still unset, which would otherwise leave the
+    // vendor fields with no recorded error AND no visible field to notice
+    // the blank in, now that they're hidden behind a closed modal.
+    if (
+      isNewVendorRequest &&
+      (formErrors.payeeName ||
+        formErrors.payeeAddress ||
+        formErrors.payeeGstin ||
+        formErrors.vendorRequestVendorEmail ||
+        !getValues("payeeName")?.trim() ||
+        !getValues("payeeAddress")?.trim() ||
+        !getValues("vendorRequestVendorEmail")?.trim())
+    ) {
+      setVendorRequestModalOpen(true);
+    }
+    setSubmitError("Please complete the highlighted required fields, then submit again.");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function startNewVendorRequest() {
+    setValue("isNewVendorRequest", true, { shouldValidate: true });
+    setValue("vendorId", undefined);
+    setValue("payeeName", "");
+    setValue("payeeAddress", "");
+    setValue("payeeEmail", "");
+    setVendorRequestModalOpen(true);
+  }
+
+  // Discards the in-progress vendor request entirely and returns to normal
+  // vendor search - identical to the previous inline "Back to vendor search
+  // instead" toggle-off logic, just invoked from the modal's close paths
+  // (X, backdrop, Escape, and the "Back to vendor search instead" button)
+  // instead of an inline button.
+  function cancelNewVendorRequest() {
+    setValue("isNewVendorRequest", false);
+    setValue("vendorRequestVendorEmail", "");
+    setValue("payeeEmail", "");
+    setVendorRequestMsmeEmailSentAt(null);
+    setVendorRequestMsmeEmailMessageId(null);
+    setVendorRequestModalOpen(false);
+  }
+
+  return (
+    <form onSubmit={handleSubmit(onSubmit, onInvalid)} className="flex flex-col gap-10" noValidate>
+      {submitError ? (
+        <div className="rounded-md border border-[#b3261e]/30 bg-[#b3261e]/5 px-4 py-3 text-sm font-medium text-[#b3261e]">
+          {submitError}
+        </div>
+      ) : null}
+
+      {!isAdvance && !isCashVoucher ? (
+        <div className="rounded-md border border-brand/20 bg-brand/5 px-4 py-3 text-sm text-brand">
+          <p className="font-medium">Try filling automatically from Tax Invoice</p>
+          <p className="mt-1 text-xs text-brand/70">
+            Upload it below and we can auto-fill Bill No., amounts, and vendor/bank details from it - saving
+            you from typing them in by hand. This is also your required Tax Invoice document; no need to
+            attach it again further down.
+          </p>
+          <div className="mt-3">
+            <FileUploadSlot
+              label="Tax Invoice"
+              required
+              allowImages
+              maxFiles={1}
+              files={taxInvoice}
+              onChange={handleTaxInvoiceChange}
+              existingFileNames={existingAttachments?.TAX_INVOICE}
+            />
+          </div>
+          {taxInvoice.length === 1 ? (
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-brand/10 pt-3">
+              <p>Ready to read this invoice?</p>
+              <button
+                type="button"
+                onClick={tryInvoiceAutoFill}
+                disabled={extractingInvoice}
+                className="rounded-md border border-brand bg-white px-3 py-1.5 font-medium hover:bg-brand/5 disabled:cursor-wait disabled:opacity-60"
+              >
+                {extractingInvoice ? "Reading invoice…" : "Try Auto-Fill"}
+              </button>
+            </div>
+          ) : null}
+          {invoiceAutoFillError ? <p role="alert" className="mt-3 rounded-md border border-[#b3261e]/30 bg-white px-3 py-2 text-sm text-[#b3261e]">{invoiceAutoFillError}</p> : null}
+        </div>
+      ) : null}
+
+      {hasInvoiceAutoFill ? (
+        <div className="rounded-md border border-[#2e8b57]/30 bg-[#2e8b57]/5 px-4 py-3 text-sm font-medium text-[#245f3d]">
+          These fields were auto-filled from your invoice - please verify they&apos;re correct before submitting.
+        </div>
+      ) : null}
+
+      {hasBankDetailsMismatch ? (
+        <div className="rounded-md border border-[#b3261e]/30 bg-[#b3261e]/5 px-4 py-3 text-sm font-medium text-[#b3261e]">
+          The bank details on file for this vendor don&apos;t match what&apos;s printed on your invoice. We&apos;ve
+          used the details on file below - please confirm with the vendor before submitting if their bank has
+          changed. This will be flagged for Finance to review.
+        </div>
+      ) : null}
+
+      <Section title="1. Submitter details">
+        <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+          <Field
+            label="Your Name"
+            required
+            htmlFor="submittedByName"
+            error={errors.submittedByName?.message}
+            help="Start typing - if you're in the staff list, we'll pick this up automatically."
+          >
+            <StaffNameTypeahead
+              id="submittedByName"
+              value={submittedByName}
+              onChange={(v) => setValue("submittedByName", v)}
+              onMatch={handleStaffMatch}
+              hasError={!!errors.submittedByName}
+            />
+          </Field>
+          <Field label="Your Email" required error={errors.submittedByEmail?.message}>
+            <Input type="email" hasError={!!errors.submittedByEmail} {...register("submittedByEmail")} />
+          </Field>
+          {HAS_DEPARTMENTS ? (
+            <Field label="Your Department" required error={errors.submittedByDepartmentOption?.message ?? errors.submittedByDepartment?.message}>
+              <div className="flex flex-col gap-3">
+                <Select
+                  hasError={!!errors.submittedByDepartmentOption}
+                  {...register("submittedByDepartmentOption", {
+                    onChange: (event) => {
+                      const next = event.target.value as PaymentAdviceFormInput["submittedByDepartmentOption"];
+                      setValue("submittedByDepartment", next === "OTHERS" ? "" : next, { shouldValidate: true });
+                    },
+                  })}
+                >
+                  <option value="">Select your department</option>
+                  {DEPARTMENT_OPTIONS.map((department) => <option key={department} value={department}>{department === "OTHERS" ? "Others" : department}</option>)}
+                </Select>
+                {submittedByDepartmentOption === "OTHERS" ? (
+                  <Input
+                    aria-label="Other department"
+                    placeholder="Enter your department"
+                    hasError={!!errors.submittedByDepartment}
+                    {...register("submittedByDepartment")}
+                  />
+                ) : (
+                  <input type="hidden" {...register("submittedByDepartment")} />
+                )}
+              </div>
+            </Field>
+          ) : null}
+          {HAS_SINGLE_BRANCH ? null : (
+            <Field label="Your Branch" required error={errors.branch?.message}>
+              <Select hasError={!!errors.branch} {...register("branch")}>
+                <option value="">Select your branch</option>
+                {BRANCH_OPTIONS.map((branch) => <option key={branch} value={branch}>{branch}</option>)}
+              </Select>
+            </Field>
+          )}
+          <div className="sm:col-span-2">
+            <Field
+              label="Recommending Authority"
+              required
+              error={errors.recommendingAuthorityId?.message}
+            >
+              <RecommendingAuthorityField
+                matchedStaff={matchedStaff}
+                allAuthorities={recommendingAuthorities}
+                value={recommendingAuthorityId}
+                onChange={(id) => setValue("recommendingAuthorityId", id, { shouldValidate: true })}
+                hasError={!!errors.recommendingAuthorityId}
+              />
+            </Field>
+          </div>
+        </div>
+      </Section>
+
+      {!isCashVoucher ? <Section title="2. Payee details">
+        <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+          <div className="sm:col-span-2">
+            <Field
+              label={isNewVendorRequest ? "Vendor Name (new vendor request)" : "Payee / Company Name"}
+              required
+              htmlFor="payeeName"
+              error={errors.payeeName?.message}
+              help={
+                isAdvance
+                  ? "Auto-filled from Your Name above - an advance is paid to you, the requester. Edit if needed."
+                  : isNewVendorRequest
+                    ? "This vendor isn't in our list yet - Finance will review this request alongside your submission."
+                    : "Search for an existing payee and select them from the list."
+              }
+            >
+              {isAdvance ? (
+                <Input id="payeeName" hasError={!!errors.payeeName} {...register("payeeName")} />
+              ) : isNewVendorRequest ? (
+                <div className="flex items-center justify-between gap-3 rounded-md border border-brand/20 bg-brand/5 px-3 py-2">
+                  <span className="truncate text-sm font-medium text-brand">
+                    {payeeName.trim() || "New vendor"} — pending approval
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setVendorRequestModalOpen(true)}
+                    className="shrink-0 text-sm font-medium text-brand underline hover:no-underline"
+                  >
+                    Edit
+                  </button>
+                </div>
+              ) : (
+                <VendorTypeahead
+                  id="payeeName"
+                  value={payeeName}
+                  onChange={(v) => setValue("payeeName", v)}
+                  onSelectVendor={applyVendor}
+                  onClearVendor={() => setValue("vendorId", undefined)}
+                  hasError={!!errors.payeeName}
+                />
+              )}
+            </Field>
+            {!isAdvance && !isNewVendorRequest ? (
+              <button
+                type="button"
+                onClick={startNewVendorRequest}
+                className="mt-2 inline-flex items-center gap-1.5 rounded-md border-2 border-brand bg-white px-4 py-1.5 text-sm font-bold text-brand hover:bg-brand/5"
+              >
+                Can&apos;t find your vendor? Request to add them.
+              </button>
+            ) : null}
+          </div>
+          {!isNewVendorRequest ? (
+            <div className="sm:col-span-2">
+              <Field label="Address" required error={errors.payeeAddress?.message}>
+                <Textarea rows={2} hasError={!!errors.payeeAddress} {...register("payeeAddress")} />
+              </Field>
+            </div>
+          ) : null}
+          <Field label="Contact Person" error={errors.payeeContactPerson?.message}>
+            <Input hasError={!!errors.payeeContactPerson} {...register("payeeContactPerson")} />
+          </Field>
+          <Field label="Contact Phone" error={errors.payeeContactPhone?.message}>
+            <Input placeholder="10 digits, optionally +91" hasError={!!errors.payeeContactPhone} {...register("payeeContactPhone")} />
+          </Field>
+          <Field
+            label="E-mail ID"
+            error={errors.payeeEmail?.message}
+            help={isNewVendorRequest ? "Same as the Vendor Email entered in the vendor request." : undefined}
+          >
+            {isNewVendorRequest ? (
+              <Input
+                type="email"
+                readOnly
+                disabled
+                value={vendorRequestVendorEmail}
+                className="bg-gray-50"
+              />
+            ) : (
+              <Input type="email" hasError={!!errors.payeeEmail} {...register("payeeEmail")} />
+            )}
+          </Field>
+          {!isNewVendorRequest ? (
+            <Field label="GSTIN" error={errors.payeeGstin?.message}>
+              <Input placeholder="15-character GSTIN" hasError={!!errors.payeeGstin} {...register("payeeGstin")} />
+            </Field>
+          ) : null}
+          <Field label="Udyam / MSME No." error={errors.payeeUdyamNumber?.message}>
+            <Input hasError={!!errors.payeeUdyamNumber} {...register("payeeUdyamNumber")} />
+          </Field>
+        </div>
+
+        {isNewVendorRequest && vendorRequestModalOpen && !isAdvance ? (
+          <VendorRequestModal
+            onClose={cancelNewVendorRequest}
+            onDone={() => setVendorRequestModalOpen(false)}
+            payeeNameRegister={register("payeeName")}
+            payeeNameError={errors.payeeName?.message}
+            payeeAddressRegister={register("payeeAddress")}
+            payeeAddressError={errors.payeeAddress?.message}
+            payeeGstinRegister={register("payeeGstin")}
+            payeeGstinError={errors.payeeGstin?.message}
+          >
+            <VendorRequestPanel
+              payeeName={payeeName}
+              submittedByName={submittedByName}
+              submittedByEmail={submittedByEmail}
+              vendorEmail={vendorRequestVendorEmail}
+              onVendorEmailChange={(v) => {
+                setValue("vendorRequestVendorEmail", v, { shouldValidate: true });
+                // Same underlying value as Payee details' own E-mail ID field
+                // for a new vendor - synced here rather than asked twice; see
+                // that field's read-only rendering above.
+                setValue("payeeEmail", v);
+                setVendorRequestMsmeEmailSentAt(null);
+                setVendorRequestMsmeEmailMessageId(null);
+              }}
+              vendorEmailError={errors.vendorRequestVendorEmail?.message}
+              msmeStatus={vendorRequestMsmeStatus}
+              onMsmeStatusChange={(v) => setValue("vendorRequestMsmeStatus", v as "MICRO" | "SMALL" | "MEDIUM" | "NOT_REGISTERED" | "UNKNOWN")}
+              msmeDocument={vendorRequestMsmeDocument}
+              onMsmeDocumentChange={setVendorRequestMsmeDocument}
+              documentType={vendorRequestDocumentType}
+              onDocumentTypeChange={setVendorRequestDocumentType}
+              msmeEmailSentAt={vendorRequestMsmeEmailSentAt}
+              onEmailSent={(sentAt, messageId) => {
+                setVendorRequestMsmeEmailSentAt(sentAt);
+                setVendorRequestMsmeEmailMessageId(messageId);
+              }}
+            />
+          </VendorRequestModal>
+        ) : null}
+      </Section> : null}
+
+      <Section title={isAdvance ? "3. Advance details" : isCashVoucher ? "2. Bill & reference" : "3. Bill & reference"}>
+        <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+          {!isAdvance && !isCashVoucher ? (
+            <>
+              <Field label="Bill No." required error={errors.billNo?.message}>
+                <Input hasError={!!errors.billNo} {...register("billNo")} />
+              </Field>
+              <Field label="Bill Date" required error={errors.billDate?.message}>
+                <Input type="date" max={today} hasError={!!errors.billDate} {...register("billDate")} />
+              </Field>
+              <><Field label="P.O. No." error={errors.poNumber?.message}>
+                <Input hasError={!!errors.poNumber} {...register("poNumber")} />
+              </Field>
+              <Field label="P.O. Date" error={errors.poDate?.message}>
+                <Input type="date" hasError={!!errors.poDate} {...register("poDate")} />
+              </Field>
+              <Field label="Delivery Challan No." error={errors.deliveryChallanNo?.message}>
+                <Input hasError={!!errors.deliveryChallanNo} {...register("deliveryChallanNo")} />
+              </Field>
+              <Field label="Delivery Challan Date" error={errors.deliveryChallanDate?.message}>
+                <Input
+                  type="date"
+                  hasError={!!errors.deliveryChallanDate}
+                  {...register("deliveryChallanDate")}
+                />
+              </Field>
+              </>
+            </>
+          ) : null}
+          {mode === "advance" ? (
+            <div className="sm:col-span-2 flex flex-col gap-6">
+              <LineItemsField
+                name="advanceParticulars"
+                heading="Particulars"
+                helpText="Add every item this advance covers and its amount."
+                descriptionPlaceholder="Description"
+                register={register}
+                control={control}
+                errors={errors}
+              />
+
+              <Field
+                label="Purpose of Advance"
+                required
+                error={errors.purposeOfAdvance?.message}
+                help="The overall reason for this advance, even if the Particulars above are a single general item."
+              >
+                <Textarea
+                  rows={2}
+                  hasError={!!errors.purposeOfAdvance}
+                  {...register("purposeOfAdvance")}
+                />
+              </Field>
+
+              <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+                <Field
+                  label="Previous Pending Advance (Rs.)"
+                  required
+                  error={errors.previousPendingAdvanceAmount?.message}
+                  help="Self-declared. Enter 0 if none."
+                >
+                  <Input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    hasError={!!errors.previousPendingAdvanceAmount}
+                    {...register("previousPendingAdvanceAmount", { valueAsNumber: true })}
+                  />
+                </Field>
+                {previousPendingAdvanceAmount > 0 ? (
+                  <Field
+                    label="Previous Pending Advance - Since"
+                    required
+                    error={errors.previousPendingAdvanceSince?.message}
+                  >
+                    <Input
+                      type="date"
+                      max={today}
+                      hasError={!!errors.previousPendingAdvanceSince}
+                      {...register("previousPendingAdvanceSince")}
+                    />
+                  </Field>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
+          {!isAdvance && paymentMode === "NEFT" ? (
+            <>
+              <Field
+                label="Basic Amount (Rs.) (*Subject to TDS)"
+                required
+                error={errors.basicAmount?.message}
+              >
+                <Input
+                  type="number"
+                  step="0.01"
+                  min="0.01"
+                  hasError={!!errors.basicAmount}
+                  {...register("basicAmount", { valueAsNumber: true })}
+                />
+              </Field>
+              <Field
+                label="GST Amount (Rs.)"
+                required
+                error={errors.gstAmount?.message}
+                help="Enter 0 if GST is not applicable"
+              >
+                <Input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  hasError={!!errors.gstAmount}
+                  {...register("gstAmount", { valueAsNumber: true })}
+                />
+              </Field>
+              <Field label="Total (Rs.)" error={errors.amount?.message}>
+                <Input
+                  type="text"
+                  readOnly
+                  disabled
+                  value={neftTotal.toLocaleString("en-IN", { minimumFractionDigits: 2 })}
+                  className="bg-gray-50"
+                />
+              </Field>
+              <div className="sm:col-span-2">
+                <Field label="Nature of Expenditure" required error={errors.natureOfExpenditure?.message}>
+                  <Textarea rows={3} hasError={!!errors.natureOfExpenditure} {...register("natureOfExpenditure")} />
+                </Field>
+              </div>
+            </>
+          ) : null}
+          {!isAdvance && paymentMode === "CASH" ? (
+            <CashVoucherItemsField
+              register={register}
+              control={control}
+              errors={errors}
+              maxBillDate={today}
+              filesByItem={cashVoucherBillFiles}
+              existingFileNames={existingCashVoucherItemAttachments}
+              onFilesChange={(clientKey, files) => setCashVoucherBillFiles((current) => ({ ...current, [clientKey]: files }))}
+              onItemRemoved={(clientKey) => setCashVoucherBillFiles((current) => {
+                const next = { ...current };
+                delete next[clientKey];
+                return next;
+              })}
+            />
+          ) : null}
+          <Field label="Form Date" required error={errors.formDate?.message} help="Automatically set to today.">
+            <input type="hidden" {...register("formDate")} />
+            <Input type="date" value={today} readOnly aria-readonly="true" tabIndex={-1} />
+          </Field>
+        </div>
+      </Section>
+
+      {!isCashVoucher ? <Section title={isAdvance ? "4. Payment mode" : "4. Bank details"}>
+        <div className="flex flex-col gap-6">
+          {isAdvance ? <Field label="Mode" required error={errors.paymentMode?.message}>
+            <div className="flex gap-6">
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="radio"
+                  checked={paymentMode === "NEFT"}
+                  onChange={() => setValue("paymentMode", "NEFT", { shouldValidate: true })}
+                />
+                NEFT
+              </label>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="radio"
+                  checked={paymentMode === "CASH"}
+                  onChange={() => setValue("paymentMode", "CASH", { shouldValidate: true })}
+                />
+                Cash
+              </label>
+            </div>
+          </Field> : null}
+
+          {paymentMode === "NEFT" && (
+            <div className={`grid grid-cols-1 gap-6 ${isAdvance ? "sm:grid-cols-3" : "sm:grid-cols-2"}`}>
+              {isAdvance ? (
+                <p className="sm:col-span-3 text-xs text-gray-500">
+                  Optional for an advance - Finance already has your bank details on file. Fill these
+                  in only if you want to provide them here as well.
+                </p>
+              ) : (
+                <VendorBankAccountFields
+                  vendorId={vendorId}
+                  submitterEmail={submittedByEmail}
+                  onApply={applyVendorBankAccount}
+                />
+              )}
+              <Field
+                label="Bank A/c No."
+                required={!isAdvance}
+                error={errors.bankAccountNo?.message}
+              >
+                <Input hasError={!!errors.bankAccountNo} {...register("bankAccountNo")} />
+              </Field>
+              <Field label="IFSC Code" required={!isAdvance} error={errors.bankIfsc?.message}>
+                <Input
+                  placeholder="e.g. HDFC0001234"
+                  hasError={!!errors.bankIfsc}
+                  {...register("bankIfsc")}
+                />
+              </Field>
+              <Field
+                label="Beneficiary Name"
+                required={!isAdvance}
+                error={errors.beneficiaryName?.message}
+              >
+                <Input hasError={!!errors.beneficiaryName} {...register("beneficiaryName")} />
+              </Field>
+              {!isAdvance ? <Field label="Bank Name" required error={errors.bankName?.message}>
+                <Input hasError={!!errors.bankName} {...register("bankName")} />
+              </Field> : null}
+            </div>
+          )}
+        </div>
+      </Section> : null}
+
+      <Section title={isCashVoucher ? "3. Enclosures & remarks" : "5. Enclosures & remarks"}>
+        <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+          <Field
+            label="Enclosures"
+            required={!isAdvance && paymentMode === "NEFT"}
+            error={errors.enclosures?.message}
+          >
+            <Textarea rows={2} hasError={!!errors.enclosures} {...register("enclosures")} />
+          </Field>
+          <Field
+            label="Special Remarks"
+            required={!isAdvance && paymentMode === "NEFT"}
+            error={errors.specialRemarks?.message}
+          >
+            <Textarea rows={2} hasError={!!errors.specialRemarks} {...register("specialRemarks")} />
+          </Field>
+        </div>
+      </Section>
+
+      <Section title={isCashVoucher ? "4. Documents" : "6. Documents"}>
+        {attachmentError ? (
+          <div className="mb-4 rounded-md border border-[#b3261e]/30 bg-[#b3261e]/5 px-4 py-3 text-sm font-medium text-[#b3261e]">
+            {attachmentError}
+          </div>
+        ) : null}
+        <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+          {!isAdvance && !isCashVoucher ? (
+            // Same underlying `taxInvoice` state and `handleTaxInvoiceChange`
+            // handler as the auto-fill prompt's own FileUploadSlot at the top
+            // of the form - there is exactly one Tax Invoice attachment per
+            // submission, and this is a second, fully functioning control
+            // over that same field, not a placeholder or a link back up.
+            // Uploading here works standalone for anyone who skips the
+            // auto-fill prompt; uploading up there shows up here too
+            // (filename + Remove/Replace), with no re-upload required either
+            // way and no duplicate Blob upload (only tryInvoiceAutoFill and
+            // final submit ever upload to Blob).
+            <FileUploadSlot
+              label="Tax Invoice"
+              required
+              allowImages
+              maxFiles={1}
+              files={taxInvoice}
+              onChange={handleTaxInvoiceChange}
+              existingFileNames={existingAttachments?.TAX_INVOICE}
+            />
+          ) : null}
+          <FileUploadSlot
+            label="Approval / Budget Letter"
+            required={isAdvance}
+            allowImages
+            maxFiles={1}
+            files={approvalBudget}
+            onChange={setApprovalBudget}
+            existingFileNames={existingAttachments?.APPROVAL_BUDGET}
+          />
+          {isAdvance ? <FileUploadSlot
+            label="Purchase Order"
+            allowImages
+            maxFiles={1}
+            files={purchaseOrder}
+            onChange={setPurchaseOrder}
+            existingFileNames={existingAttachments?.PURCHASE_ORDER}
+          /> : null}
+          {isAdvance ? <FileUploadSlot
+            label="Delivery Challan"
+            allowImages
+            maxFiles={1}
+            files={deliveryChallanFile}
+            onChange={setDeliveryChallanFile}
+            existingFileNames={existingAttachments?.DELIVERY_CHALLAN}
+          /> : null}
+          {isAdvance ? <FileUploadSlot
+            label="Other"
+            allowImages
+            multiple
+            maxFiles={MAX_OTHER_ATTACHMENTS}
+            files={otherFiles}
+            onChange={setOtherFiles}
+            existingFileNames={existingAttachments?.OTHER}
+          /> : null}
+          {!isAdvance && !isCashVoucher ? <FileUploadSlot
+            label="Other Documents"
+            multiple
+            maxFiles={MAX_OTHER_ATTACHMENTS}
+            allowImages
+            files={otherFiles}
+            onChange={setOtherFiles}
+            existingFileNames={existingAttachments?.OTHER}
+          /> : null}
+          {isCashVoucher ? <FileUploadSlot
+            label="Other Documents"
+            multiple
+            maxFiles={MAX_OTHER_ATTACHMENTS}
+            allowImages
+            files={otherFiles}
+            onChange={setOtherFiles}
+            existingFileNames={existingAttachments?.OTHER}
+          /> : null}
+        </div>
+        <p className="text-sm font-medium text-brand" aria-live="polite">
+          {(attachmentTotalBytes / 1024 / 1024).toFixed(2)} MB of new attachments added
+        </p>
+      </Section>
+
+      <div className="flex justify-end border-t border-gray-200 pt-6">
+        <button
+          type="submit"
+          disabled={submitting}
+          className="rounded-md bg-brand px-6 py-3 text-base font-medium text-white shadow-sm transition hover:bg-brand/90 disabled:opacity-50"
+        >
+          {submitting
+            ? uploadingAttachments
+              ? "Uploading attachments…"
+              : "Submitting…"
+            : editToken
+              ? "Resubmit"
+              : isAdvance
+                ? "Submit Advance Payment Request"
+                : isCashVoucher
+                  ? "Submit Cash Payment Voucher"
+                  : "Submit Payment Advice"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+async function cleanupPendingUploads(uploads: UploadedAttachment[]) {
+  if (uploads.length === 0) return;
+  await cleanupPendingBlob(...uploads.map((upload) => upload.blobPathname));
+}
+
+async function cleanupPendingBlob(...pathnames: string[]) {
+  if (pathnames.length === 0) return;
+  await fetch("/api/attachments/cleanup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pathnames }),
+  }).catch(() => undefined);
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section className="flex flex-col gap-6">
+      <h2 className="font-heading text-2xl text-brand">{title}</h2>
+      {children}
+    </section>
+  );
+}

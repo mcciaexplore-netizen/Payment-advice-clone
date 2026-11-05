@@ -1,0 +1,571 @@
+import { describe, expect, it } from "vitest";
+import {
+  calculateCashVoucherTotal,
+  paymentAdviceFormSchema,
+  VERIFIER_NAMES,
+  verifierNameSchema,
+  BRANCH_OPTIONS,
+  DEPARTMENT_OPTIONS,
+  cashVoucherItemSchema,
+} from "./payment-advice";
+import { ORG } from "@/lib/config";
+
+describe("VERIFIER_NAMES spelling", () => {
+  it('spells the name "Nisha Sample", matching the authoritative staff/email list', () => {
+    expect(VERIFIER_NAMES).toContain("Nisha Sample");
+    expect(VERIFIER_NAMES).not.toContain("ANisha Sample");
+  });
+
+  it("rejects the old misspelling as an invalid verifier", () => {
+    expect(verifierNameSchema.safeParse("ANisha Sample").success).toBe(false);
+  });
+
+  it("accepts the corrected spelling", () => {
+    expect(verifierNameSchema.safeParse("Nisha Sample").success).toBe(true);
+  });
+});
+
+describe("shared Submitter details validation", () => {
+  it("keeps the fixed Branch and Department options in the required order", () => {
+    expect(BRANCH_OPTIONS).toEqual(["Main Office", "Branch Office 1", "Branch Office 2", "Branch Office 3", "Branch Office 4"]);
+    expect(DEPARTMENT_OPTIONS).toEqual(ORG.departments);
+  });
+  it("requires one of the five fixed branches", () => {
+    const missing = paymentAdviceFormSchema.safeParse({ ...baseNeftSubmission, branch: undefined });
+    expect(missing.success).toBe(false);
+    if (!missing.success) expect(missing.error.issues.some((issue) => issue.path[0] === "branch")).toBe(true);
+
+    const invalid = paymentAdviceFormSchema.safeParse({ ...baseNeftSubmission, branch: "Mumbai Office" });
+    expect(invalid.success).toBe(false);
+  });
+
+  it("stores a fixed department only when it matches the selected option", () => {
+    expect(paymentAdviceFormSchema.safeParse(baseNeftSubmission).success).toBe(true);
+    const mismatch = paymentAdviceFormSchema.safeParse({ ...baseNeftSubmission, submittedByDepartment: "RAMP" });
+    expect(mismatch.success).toBe(false);
+  });
+
+  it("requires free text when OTHERS is selected", () => {
+    const missing = paymentAdviceFormSchema.safeParse({
+      ...baseNeftSubmission,
+      submittedByDepartmentOption: "OTHERS",
+      submittedByDepartment: "",
+    });
+    expect(missing.success).toBe(false);
+    const custom = paymentAdviceFormSchema.safeParse({
+      ...baseNeftSubmission,
+      submittedByDepartmentOption: "OTHERS",
+      submittedByDepartment: "International Trade",
+    });
+    expect(custom.success).toBe(true);
+  });
+});
+
+describe("Cash Voucher new-row identifiers", () => {
+  it("normalizes the browser's empty hidden ID while preserving historical UUIDs", () => {
+    const item = {
+      clientKey: "11111111-1111-4111-8111-111111111111",
+      billNo: "B-1",
+      billDate: "2026-09-07",
+      description: "Local travel",
+      amount: 100,
+    };
+    expect(cashVoucherItemSchema.parse({ ...item, id: "" }).id).toBeUndefined();
+    expect(cashVoucherItemSchema.safeParse({ ...item, id: "22222222-2222-4222-8222-222222222222" }).success).toBe(true);
+  });
+
+  it("accepts an OTHERS department together with a fresh Cash expense row", () => {
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseCashSubmission,
+      submittedByDepartmentOption: "OTHERS",
+      submittedByDepartment: "ERU",
+      cashVoucherItems: [{
+        id: "",
+        clientKey: "11111111-1111-4111-8111-111111111111",
+        billNo: "B-1",
+        billDate: "2026-09-07",
+        description: "Local travel",
+        amount: 150.5,
+      }],
+    });
+    expect(result.success).toBe(true);
+  });
+});
+
+const baseCashSubmission = {
+  submittedByName: "Priya Sharma",
+  submittedByEmail: "priya@example.com",
+  submittedByDepartmentOption: "ADMIN" as const,
+  submittedByDepartment: "ADMIN",
+  branch: "Main Office" as const,
+  recommendingAuthorityId: "11111111-1111-4111-8111-111111111111",
+  payeeName: "Acme Supplies",
+  payeeAddress: "Pune",
+  billNo: "INV-1",
+  billDate: "2026-07-20",
+  formDate: "2026-07-21",
+  paymentMode: "CASH" as const,
+  amount: 150.5,
+  cashVoucherItems: [
+    { clientKey: "22222222-2222-4222-8222-222222222222", description: "Stationery", amount: 100.25 },
+    { clientKey: "33333333-3333-4333-8333-333333333333", description: "Local conveyance", amount: 50.25 },
+  ],
+};
+
+const baseNeftSubmission = {
+  submittedByName: "Priya Sharma",
+  submittedByEmail: "priya@example.com",
+  submittedByDepartmentOption: "ADMIN" as const,
+  submittedByDepartment: "ADMIN",
+  branch: "Main Office" as const,
+  recommendingAuthorityId: "11111111-1111-4111-8111-111111111111",
+  vendorId: "44444444-4444-4444-8444-444444444444",
+  payeeName: "Acme Supplies",
+  payeeAddress: "Pune",
+  billNo: "INV-1",
+  billDate: "2026-07-20",
+  formDate: "2026-07-21",
+  paymentMode: "NEFT" as const,
+  natureOfExpenditure: "Office supplies",
+  bankAccountNo: "123456789012",
+  bankIfsc: "HDFC0001234",
+  beneficiaryName: "Acme Supplies",
+  bankName: "HDFC Bank",
+  cashVoucherItems: [],
+  basicAmount: 1000,
+  gstAmount: 180,
+  amount: 1180,
+  enclosures: "Tax invoice and approval letter",
+  specialRemarks: "Process against the attached invoice",
+};
+
+describe("Vendor selection required for a regular Payment Advice", () => {
+  it("rejects a regular Payment Advice with no vendorId (free-text payee is no longer accepted)", () => {
+    const noVendor: Record<string, unknown> = { ...baseNeftSubmission };
+    delete noVendor.vendorId;
+    const result = paymentAdviceFormSchema.safeParse(noVendor);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error.issues.some((issue) => issue.path[0] === "payeeName")).toBe(true);
+  });
+
+  it("accepts a regular Payment Advice with a vendorId", () => {
+    expect(paymentAdviceFormSchema.safeParse(baseNeftSubmission).success).toBe(true);
+  });
+
+  it("does not require vendorId for an Advance Payment (payee is always the submitter there)", () => {
+    const result = paymentAdviceFormSchema.safeParse(baseAdvanceNeftSubmission);
+    expect(result.success).toBe(true);
+  });
+
+  it("does not require vendorId for a Cash Voucher (no vendor typeahead exists there)", () => {
+    expect(paymentAdviceFormSchema.safeParse(baseCashSubmission).success).toBe(true);
+  });
+});
+
+describe("NEFT Basic/GST split validation", () => {
+  it("accepts a NEFT submission when basicAmount + gstAmount equals amount", () => {
+    expect(paymentAdviceFormSchema.safeParse(baseNeftSubmission).success).toBe(true);
+  });
+
+  it("requires Bank Name for a regular Payment Advice", () => {
+    const result = paymentAdviceFormSchema.safeParse({ ...baseNeftSubmission, bankName: "" });
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error.issues.some((issue) => issue.path[0] === "bankName")).toBe(true);
+  });
+
+  it("allows Cash Voucher bill and payee-address fields to be omitted", () => {
+    const cash: Record<string, unknown> = { ...baseCashSubmission };
+    delete cash.billNo;
+    delete cash.billDate;
+    delete cash.payeeAddress;
+    expect(paymentAdviceFormSchema.safeParse(cash).success).toBe(true);
+  });
+
+  it("accepts gstAmount of exactly 0 (GST not applicable)", () => {
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseNeftSubmission,
+      gstAmount: 0,
+      amount: 1000,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a missing basicAmount", () => {
+    const rest: Record<string, unknown> = { ...baseNeftSubmission };
+    delete rest.basicAmount;
+    const result = paymentAdviceFormSchema.safeParse(rest);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join(".") === "basicAmount")).toBe(true);
+    }
+  });
+
+  it("rejects a missing gstAmount — must be explicit, even when 0", () => {
+    const rest: Record<string, unknown> = { ...baseNeftSubmission };
+    delete rest.gstAmount;
+    const result = paymentAdviceFormSchema.safeParse(rest);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join(".") === "gstAmount")).toBe(true);
+    }
+  });
+
+  it("rejects a negative gstAmount", () => {
+    const result = paymentAdviceFormSchema.safeParse({ ...baseNeftSubmission, gstAmount: -5 });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a total that doesn't match basicAmount + gstAmount", () => {
+    const result = paymentAdviceFormSchema.safeParse({ ...baseNeftSubmission, amount: 999 });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join(".") === "amount")).toBe(true);
+    }
+  });
+
+  it("rejects a missing billNo for a non-advance submission", () => {
+    const rest: Record<string, unknown> = { ...baseNeftSubmission };
+    delete rest.billNo;
+    const result = paymentAdviceFormSchema.safeParse(rest);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join(".") === "billNo")).toBe(true);
+    }
+  });
+
+  it("rejects a missing billDate for a non-advance submission", () => {
+    const rest: Record<string, unknown> = { ...baseNeftSubmission };
+    delete rest.billDate;
+    const result = paymentAdviceFormSchema.safeParse(rest);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join(".") === "billDate")).toBe(true);
+    }
+  });
+
+  it("rejects a future billDate for a non-advance submission", () => {
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseNeftSubmission,
+      billDate: "2099-01-01",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join(".") === "billDate")).toBe(true);
+    }
+  });
+
+  it("keeps P.O. number and P.O. date optional for a standard NEFT submission", () => {
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseNeftSubmission,
+      poNumber: "",
+      poDate: "",
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.poNumber).toBeUndefined();
+      expect(result.data.poDate).toBeUndefined();
+    }
+  });
+
+  it("validates P.O. date format only when an optional value is supplied", () => {
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseNeftSubmission,
+      poDate: "03/09/2026",
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toContainEqual(
+        expect.objectContaining({ path: ["poDate"], message: "Enter a valid date" }),
+      );
+    }
+  });
+});
+
+describe("standard NEFT Enclosures & Remarks validation", () => {
+  it.each([
+    ["enclosures", "Enclosures are required"],
+    ["specialRemarks", "Special Remarks are required"],
+  ] as const)("requires a non-empty %s value", (field, message) => {
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseNeftSubmission,
+      [field]: "   ",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toContainEqual(
+        expect.objectContaining({ path: [field], message }),
+      );
+    }
+  });
+
+  it("reports clear errors for both fields when both are empty", () => {
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseNeftSubmission,
+      enclosures: "",
+      specialRemarks: "",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((issue) => issue.path.join("."))).toEqual(
+        expect.arrayContaining(["enclosures", "specialRemarks"]),
+      );
+    }
+  });
+
+  it("leaves the regular Cash Voucher form optional", () => {
+    expect(
+      paymentAdviceFormSchema.safeParse({
+        ...baseCashSubmission,
+        enclosures: "",
+        specialRemarks: "",
+      }).success,
+    ).toBe(true);
+  });
+
+  it("leaves the /advance form optional even when routed through NEFT", () => {
+    expect(
+      paymentAdviceFormSchema.safeParse({
+        ...baseAdvanceNeftSubmission,
+        enclosures: "",
+        specialRemarks: "",
+      }).success,
+    ).toBe(true);
+  });
+});
+
+const baseAdvanceNeftSubmission = {
+  submittedByName: "Priya Sharma",
+  submittedByEmail: "priya@example.com",
+  submittedByDepartmentOption: "ADMIN" as const,
+  submittedByDepartment: "ADMIN",
+  branch: "Main Office" as const,
+  recommendingAuthorityId: "11111111-1111-4111-8111-111111111111",
+  payeeName: "Acme Supplies",
+  payeeAddress: "Pune",
+  billNo: "INV-1",
+  billDate: "2026-07-20",
+  formDate: "2026-07-21",
+  paymentMode: "NEFT" as const,
+  isAdvance: true,
+  purposeOfAdvance: "Client visit to Delhi",
+  previousPendingAdvanceAmount: 0,
+  bankAccountNo: "123456789012",
+  bankIfsc: "HDFC0001234",
+  beneficiaryName: "Acme Supplies",
+  cashVoucherItems: [],
+  advanceParticulars: [
+    { description: "Conveyance", amount: 500 },
+    { description: "Traveling to Delhi", amount: 1500 },
+  ],
+  amount: 2000,
+};
+
+describe("Advance Payment validation", () => {
+  it("accepts an advance when the Particulars total matches amount, bypassing Basic/GST entirely", () => {
+    const result = paymentAdviceFormSchema.safeParse(baseAdvanceNeftSubmission);
+    expect(result.success).toBe(true);
+  });
+
+  it("computes the Particulars total in paise, reusing calculateCashVoucherTotal directly — same schema/helper as Cash Voucher's line items, not a separate one", () => {
+    expect(calculateCashVoucherTotal(baseAdvanceNeftSubmission.advanceParticulars)).toBe(2000);
+  });
+
+  it("rejects a missing Purpose of Advance", () => {
+    const rest: Record<string, unknown> = { ...baseAdvanceNeftSubmission };
+    delete rest.purposeOfAdvance;
+    const result = paymentAdviceFormSchema.safeParse(rest);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join(".") === "purposeOfAdvance")).toBe(
+        true,
+      );
+    }
+  });
+
+  it("rejects zero Particulars line items", () => {
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseAdvanceNeftSubmission,
+      advanceParticulars: [],
+      amount: 0,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("requires a description for each Particulars row — same free-text description+amount shape as Cash Voucher, no category dropdown", () => {
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseAdvanceNeftSubmission,
+      advanceParticulars: [{ description: "", amount: 2000 }],
+      amount: 2000,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(
+        result.error.issues.some((issue) => issue.path.join(".") === "advanceParticulars.0.description"),
+      ).toBe(true);
+    }
+  });
+
+  it("accepts a single free-text Particulars row", () => {
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseAdvanceNeftSubmission,
+      advanceParticulars: [{ description: "Venue booking deposit", amount: 2000 }],
+      amount: 2000,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a Particulars total that doesn't match the submitted amount", () => {
+    const result = paymentAdviceFormSchema.safeParse({ ...baseAdvanceNeftSubmission, amount: 999 });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join(".") === "amount")).toBe(true);
+    }
+  });
+
+  it("defaults Previous Pending Advance amount to 0 and does not require 'Since' when 0", () => {
+    const rest: Record<string, unknown> = { ...baseAdvanceNeftSubmission };
+    delete rest.previousPendingAdvanceAmount;
+    const result = paymentAdviceFormSchema.safeParse(rest);
+    expect(result.success).toBe(true);
+  });
+
+  it("requires 'Since' when Previous Pending Advance amount is > 0", () => {
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseAdvanceNeftSubmission,
+      previousPendingAdvanceAmount: 5000,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(
+        result.error.issues.some(
+          (issue) => issue.path.join(".") === "previousPendingAdvanceSince",
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it("accepts Previous Pending Advance > 0 when 'Since' is provided", () => {
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseAdvanceNeftSubmission,
+      previousPendingAdvanceAmount: 5000,
+      previousPendingAdvanceSince: "2026-06-01",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("does NOT require NEFT bank details for an NEFT-routed advance — Finance already has them on file for staff", () => {
+    const rest: Record<string, unknown> = { ...baseAdvanceNeftSubmission };
+    delete rest.bankAccountNo;
+    delete rest.bankIfsc;
+    delete rest.beneficiaryName;
+    const result = paymentAdviceFormSchema.safeParse(rest);
+    expect(result.success).toBe(true);
+    // Sanity: the same shape WITHOUT isAdvance would fail for missing bank details.
+    const nonAdvanceResult = paymentAdviceFormSchema.safeParse({ ...rest, isAdvance: false });
+    expect(nonAdvanceResult.success).toBe(false);
+  });
+
+  it("still accepts NEFT bank details when the submitter provides them anyway on an advance", () => {
+    expect(paymentAdviceFormSchema.safeParse(baseAdvanceNeftSubmission).success).toBe(true);
+  });
+
+  it("does NOT require billNo/billDate/PO/Delivery Challan for an advance — no bill exists yet", () => {
+    const rest: Record<string, unknown> = { ...baseAdvanceNeftSubmission };
+    delete rest.billNo;
+    delete rest.billDate;
+    const result = paymentAdviceFormSchema.safeParse(rest);
+    expect(result.success).toBe(true);
+  });
+
+  it("tolerates a stale empty-string billDate/basicAmount/gstAmount/NaN left behind by a hidden field react-hook-form registered before the mode switch to Advance", () => {
+    // Regression guard: billDate, poDate, deliveryChallanDate, basicAmount
+    // and gstAmount all render (and so get registered by react-hook-form)
+    // by default, since paymentMode defaults to NEFT non-advance on page
+    // load. If the submitter switches straight to Advance Payment without
+    // ever touching them, react-hook-form retains their untouched native
+    // uncontrolled defaults ("" for date/text inputs, NaN for a
+    // valueAsNumber-registered empty number input) in its internal form
+    // state even after the fields unmount — this must not silently block
+    // submission (previously did: optionalDateString's regex ran before
+    // its empty-to-undefined transform, and NaN isn't forgiven by
+    // z.number().optional()).
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseAdvanceNeftSubmission,
+      billDate: "",
+      poDate: "",
+      deliveryChallanDate: "",
+      basicAmount: NaN,
+      gstAmount: NaN,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("tolerates the same stale empty-string 'Since' left behind after Previous Pending Advance amount drops back to 0", () => {
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseAdvanceNeftSubmission,
+      previousPendingAdvanceAmount: 0,
+      previousPendingAdvanceSince: "",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("does NOT require basicAmount/gstAmount/natureOfExpenditure for an advance", () => {
+    const result = paymentAdviceFormSchema.safeParse(baseAdvanceNeftSubmission);
+    expect(result.success).toBe(true);
+    // Sanity: the same shape WITHOUT isAdvance would fail for missing basicAmount.
+    const nonAdvanceResult = paymentAdviceFormSchema.safeParse({
+      ...baseAdvanceNeftSubmission,
+      isAdvance: false,
+    });
+    expect(nonAdvanceResult.success).toBe(false);
+  });
+
+  it("accepts a Cash-routed advance, bypassing cashVoucherItems entirely", () => {
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseAdvanceNeftSubmission,
+      paymentMode: "CASH" as const,
+      bankAccountNo: undefined,
+      bankIfsc: undefined,
+      beneficiaryName: undefined,
+    });
+    expect(result.success).toBe(true);
+  });
+});
+
+describe("Cash voucher validation", () => {
+  it("sums item amounts in paise", () => {
+    expect(calculateCashVoucherTotal(baseCashSubmission.cashVoucherItems)).toBe(150.5);
+  });
+
+  it("accepts a Cash submission when the server-side item sum matches amount", () => {
+    expect(paymentAdviceFormSchema.safeParse(baseCashSubmission).success).toBe(true);
+  });
+
+  it("rejects a client-supplied amount that differs from the item total", () => {
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseCashSubmission,
+      amount: 150.49,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join(".") === "amount")).toBe(true);
+    }
+  });
+
+  it("tolerates a stale NaN basicAmount/gstAmount left behind by react-hook-form when the submitter switches straight from the default NEFT mode to Cash", () => {
+    // Same regression class as the Advance Payment case above — basicAmount
+    // and gstAmount render by default (paymentMode starts as NEFT), so they
+    // get registered before a submitter who goes straight to Cash ever
+    // touches them.
+    const result = paymentAdviceFormSchema.safeParse({
+      ...baseCashSubmission,
+      billNo: "INV-1",
+      billDate: "2026-07-20",
+      basicAmount: NaN,
+      gstAmount: NaN,
+    });
+    expect(result.success).toBe(true);
+  });
+});

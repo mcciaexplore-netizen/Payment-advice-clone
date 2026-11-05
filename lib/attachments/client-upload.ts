@@ -1,0 +1,93 @@
+import { z } from "zod";
+import {
+  DOC_TYPES,
+  MAX_FILE_SIZE_BYTES,
+  MAX_OTHER_ATTACHMENTS,
+  type DocType,
+  type PaymentMode,
+} from "@/lib/validation/payment-advice";
+
+export const PENDING_UPLOAD_PREFIX = "pending-uploads/";
+
+export const uploadedAttachmentSchema = z.object({
+  docType: z.enum(DOC_TYPES),
+  fileName: z.string().trim().min(1).max(255),
+  blobPathname: z.string().startsWith(PENDING_UPLOAD_PREFIX).max(1024),
+  blobUrl: z.string().url().max(2048),
+  sizeBytes: z.number().int().positive().max(MAX_FILE_SIZE_BYTES),
+  cashVoucherItemKey: z.string().uuid().optional(),
+}).superRefine((value, ctx) => {
+  if (value.docType === "CASH_VOUCHER_BILL" && !value.cashVoucherItemKey) {
+    ctx.addIssue({ code: "custom", path: ["cashVoucherItemKey"], message: "Cash Voucher item key is required." });
+  }
+  if (value.docType !== "CASH_VOUCHER_BILL" && value.cashVoucherItemKey) {
+    ctx.addIssue({ code: "custom", path: ["cashVoucherItemKey"], message: "Cash Voucher item key is not allowed for this document type." });
+  }
+});
+
+export type UploadedAttachment = z.infer<typeof uploadedAttachmentSchema>;
+
+export function parseUploadedAttachments(value: FormDataEntryValue | null) {
+  if (typeof value !== "string") return { error: "Attachment metadata is missing." } as const;
+  try {
+    const parsed = z.array(uploadedAttachmentSchema).safeParse(JSON.parse(value));
+    if (!parsed.success) return { error: "Attachment metadata is invalid." } as const;
+    return { attachments: parsed.data } as const;
+  } catch {
+    return { error: "Attachment metadata is invalid." } as const;
+  }
+}
+
+export function groupUploadedAttachments(uploads: UploadedAttachment[]) {
+  const byDocType: Record<DocType, UploadedAttachment[]> = {
+    TAX_INVOICE: [],
+    APPROVAL_BUDGET: [],
+    PURCHASE_ORDER: [],
+    DELIVERY_CHALLAN: [],
+    OTHER: [],
+    CASH_VOUCHER_BILL: [],
+  };
+  for (const upload of uploads) byDocType[upload.docType].push(upload);
+  return byDocType;
+}
+
+export function validateAttachmentCounts(
+  byDocType: Record<DocType, UploadedAttachment[]>,
+  isAdvance: boolean,
+  existingCounts?: Partial<Record<DocType, number>>,
+  paymentMode?: PaymentMode,
+): string | null {
+  if (byDocType.TAX_INVOICE.length > 1) return "Only one Tax Invoice file is allowed.";
+  if (byDocType.APPROVAL_BUDGET.length > 1)
+    return "Only one Approval / Budget Letter file is allowed.";
+  if (byDocType.PURCHASE_ORDER.length > 1) return "Only one Purchase Order file is allowed.";
+  if (byDocType.DELIVERY_CHALLAN.length > 1)
+    return "Only one Delivery Challan file is allowed.";
+  if (byDocType.OTHER.length > MAX_OTHER_ATTACHMENTS)
+    return `At most ${MAX_OTHER_ATTACHMENTS} "Other" files are allowed.`;
+  if (byDocType.CASH_VOUCHER_BILL.length > 10)
+    return "At most 10 Cash Voucher bill files are allowed.";
+  // Purchase Order / Delivery Challan belong to the "Bill & Reference"
+  // section, which only exists on the regular Payment Advice (NEFT) form —
+  // Advance and Cash Voucher both hide that section entirely and have no
+  // UI path to select these file types. The condition below must therefore
+  // block them for isAdvance OR Cash, not "not Advance" alone — the
+  // previous `!isAdvance` version also blocked them for regular Payment
+  // Advice, where they're a legitimate optional attachment (see SPEC.md).
+  // This is what silently rejected a real resubmission where Finance had
+  // explicitly asked the submitter to add a Purchase Order.
+  if ((isAdvance || paymentMode === "CASH") && (byDocType.PURCHASE_ORDER.length || byDocType.DELIVERY_CHALLAN.length))
+    return "Only Tax Invoice / Supplementary Document and Approval / Budget Letter attachments are allowed.";
+  if ((isAdvance || paymentMode !== "CASH") && byDocType.CASH_VOUCHER_BILL.length)
+    return "Cash Voucher bill attachments are available only for Cash Voucher expenses.";
+
+  if (!isAdvance && paymentMode !== "CASH" && byDocType.TAX_INVOICE.length === 0 && !existingCounts?.TAX_INVOICE)
+    return "Tax Invoice / Supplementary Document is a mandatory attachment (exactly one file).";
+  if (isAdvance && byDocType.APPROVAL_BUDGET.length === 0 && !existingCounts?.APPROVAL_BUDGET)
+    return "Approval / Budget Letter is a mandatory attachment (exactly one file).";
+  return null;
+}
+
+export function safeUploadFileName(fileName: string) {
+  return fileName.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "document.pdf";
+}

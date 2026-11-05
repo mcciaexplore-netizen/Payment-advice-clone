@@ -1,0 +1,535 @@
+import { NextRequest, NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
+import { and, eq } from "drizzle-orm";
+import { del } from "@vercel/blob";
+import { db } from "@/lib/db";
+import {
+  paymentAdvices,
+  attachments,
+  auditLog,
+  cashVoucherItems,
+  advanceParticulars,
+  recommendingAuthorities,
+  vendorRequests,
+} from "@/lib/db/schema";
+import { notifyAuthorityApproval } from "@/lib/email/notify";
+import { generateAuthorityToken } from "@/lib/advice/authority-token";
+import { displayNoFor, documentLabelFor } from "@/lib/advice/document-identity";
+import {
+  allocateAdvanceNumber,
+  allocateCashVoucherNumber,
+  allocatePaymentAdviceNumber,
+} from "@/lib/serial";
+import { parsePaymentAdviceFormData } from "@/lib/form-data";
+import {
+  paymentAdviceFormSchema,
+  DOC_TYPES,
+  DocType,
+} from "@/lib/validation/payment-advice";
+import {
+  groupUploadedAttachments,
+  parseUploadedAttachments,
+  validateAttachmentCounts,
+} from "@/lib/attachments/client-upload";
+import { verifyUploadedAttachments } from "@/lib/attachments/verify-uploaded";
+import { validateCashVoucherBillUploads } from "@/lib/attachments/cash-voucher-bills";
+import { isActiveVendor } from "@/lib/advice/vendor-check";
+import { captureVendorBankAccount } from "@/lib/advice/vendor-bank-accounts";
+import { todayInIst } from "@/lib/date-time";
+import { DEPARTMENT_NAME } from "@/lib/branding";
+
+export const runtime = "nodejs";
+
+function clientIp(req: NextRequest): string | null {
+  return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? null;
+}
+
+export async function POST(
+  req: NextRequest,
+  { params }: { params: Promise<{ token: string }> },
+) {
+  const { token } = await params;
+
+  const [advice] = await db
+    .select()
+    .from(paymentAdvices)
+    .where(eq(paymentAdvices.editToken, token))
+    .limit(1);
+
+  if (
+    !advice ||
+    advice.status !== "SENT_BACK" ||
+    !advice.editTokenExpiresAt ||
+    advice.editTokenExpiresAt < new Date()
+  ) {
+    return NextResponse.json(
+      { error: "This edit link is no longer valid. Please contact Accounts." },
+      { status: 410 },
+    );
+  }
+
+  const formData = await req.formData();
+
+  const parsed = paymentAdviceFormSchema.safeParse(parsePaymentAdviceFormData(formData));
+
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: parsed.error.issues[0]?.message ?? "Invalid form data" },
+      { status: 400 },
+    );
+  }
+  const values = parsed.data;
+
+  // Same active-vendor guard as /api/submit — a resubmission can just as
+  // easily arrive via a direct API call with a bypassed/stale vendorId.
+  if (
+    values.paymentMode === "NEFT" &&
+    !values.isAdvance &&
+    !values.isNewVendorRequest &&
+    !(await isActiveVendor(values.vendorId!))
+  ) {
+    return NextResponse.json(
+      { error: "Select a vendor from the list - free-text payee names are no longer accepted" },
+      { status: 400 },
+    );
+  }
+
+  const attachmentResult = parseUploadedAttachments(formData.get("uploadedAttachments"));
+  if ("error" in attachmentResult) {
+    return NextResponse.json({ error: attachmentResult.error }, { status: 400 });
+  }
+  const newAttachments = attachmentResult.attachments;
+  const byDocType = groupUploadedAttachments(newAttachments);
+
+  const existingAttachments = await db
+    .select()
+    .from(attachments)
+    .where(eq(attachments.paymentAdviceId, advice.id));
+  const existingCashItems = await db
+    .select()
+    .from(cashVoucherItems)
+    .where(eq(cashVoucherItems.paymentAdviceId, advice.id));
+  const existingByDocType = new Map<DocType, typeof existingAttachments>();
+  for (const a of existingAttachments) {
+    const docType = a.docType as DocType;
+    const list = existingByDocType.get(docType) ?? [];
+    list.push(a);
+    existingByDocType.set(docType, list);
+  }
+
+  const existingCounts = Object.fromEntries(
+    DOC_TYPES.map((docType) => [docType, existingByDocType.get(docType)?.length ?? 0]),
+  ) as Record<DocType, number>;
+  const countError = validateAttachmentCounts(
+    byDocType,
+    values.isAdvance,
+    existingCounts,
+    values.paymentMode,
+  );
+  if (countError) return NextResponse.json({ error: countError }, { status: 400 });
+  const existingCashItemIds = new Set(
+    existingCashItems.filter((item) => item.attachmentId).map((item) => item.id),
+  );
+  const cashBillError = values.paymentMode === "CASH" && !values.isAdvance
+    ? validateCashVoucherBillUploads(values.cashVoucherItems, newAttachments, existingCashItemIds)
+    : null;
+  if (cashBillError) return NextResponse.json({ error: cashBillError }, { status: 400 });
+  const verificationError = await verifyUploadedAttachments(newAttachments, true);
+  if (verificationError) return NextResponse.json({ error: verificationError }, { status: 400 });
+
+  // Vendor request's own optional MSME document - same Blob verification as
+  // every other attachment (see app/api/submit/route.ts for the same block).
+  const vendorRequestMsmeDocument =
+    values.isNewVendorRequest &&
+    values.vendorRequestMsmeDocumentUrl &&
+    values.vendorRequestMsmeDocumentPathname &&
+    values.vendorRequestMsmeDocumentFileName &&
+    values.vendorRequestMsmeDocumentSizeBytes
+      ? {
+          fileName: values.vendorRequestMsmeDocumentFileName,
+          blobPathname: values.vendorRequestMsmeDocumentPathname,
+          blobUrl: values.vendorRequestMsmeDocumentUrl,
+          sizeBytes: values.vendorRequestMsmeDocumentSizeBytes,
+        }
+      : null;
+  if (vendorRequestMsmeDocument) {
+    const msmeVerificationError = await verifyUploadedAttachments([vendorRequestMsmeDocument], true);
+    if (msmeVerificationError) return NextResponse.json({ error: msmeVerificationError }, { status: 400 });
+  }
+
+  const uploadedPathnames = newAttachments.map((attachment) => attachment.blobPathname);
+  if (vendorRequestMsmeDocument) uploadedPathnames.push(vendorRequestMsmeDocument.blobPathname);
+  try {
+    const newAttachmentRecords = newAttachments.map((attachment) => ({
+      ...attachment,
+      id: randomUUID(),
+    }));
+    const newCashBillIds = new Map(
+      newAttachmentRecords
+        .filter((attachment) => attachment.docType === "CASH_VOUCHER_BILL")
+        .map((attachment) => [attachment.cashVoucherItemKey!, attachment.id]),
+    );
+    const oldCashAttachmentIdByItemId = new Map(
+      existingCashItems.flatMap((item) => item.attachmentId ? [[item.id, item.attachmentId] as const] : []),
+    );
+    const retainedCashAttachmentIds = new Set(
+      values.paymentMode === "CASH" && !values.isAdvance
+        ? values.cashVoucherItems.flatMap((item) =>
+            !newCashBillIds.has(item.clientKey) && item.id && oldCashAttachmentIdByItemId.has(item.id)
+              ? [oldCashAttachmentIdByItemId.get(item.id)!]
+              : [],
+          )
+        : [],
+    );
+
+    const now = new Date();
+    const formDate = todayInIst(now);
+    const oldBlobPathnamesToDelete: string[] = [];
+    const { token: authorityToken, expiresAt: authorityTokenExpiresAt } = generateAuthorityToken();
+
+    // Keep the canonical reference in the submission type's independent
+    // series. A type change on resubmission allocates from the destination
+    // series; staying in the same type retains the existing reference.
+    let serialNo: string;
+    let cashVoucherNo: string | null = null;
+    let advanceNo: string | null = null;
+    if (values.isAdvance) {
+      advanceNo = advice.isAdvance
+        ? advice.advanceNo ?? advice.serialNo
+        : await db.transaction((tx) => allocateAdvanceNumber(tx, advice.financialYear));
+      serialNo = advanceNo;
+    } else if (values.paymentMode === "CASH") {
+      cashVoucherNo = !advice.isAdvance && advice.paymentMode === "CASH"
+        ? advice.cashVoucherNo ?? advice.serialNo
+        : await db.transaction((tx) => allocateCashVoucherNumber(tx, advice.financialYear));
+      serialNo = cashVoucherNo;
+    } else if (!advice.isAdvance && advice.paymentMode === "NEFT") {
+      serialNo = advice.serialNo;
+    } else {
+      serialNo = await db.transaction((tx) =>
+        allocatePaymentAdviceNumber(tx, advice.financialYear),
+      );
+    }
+
+    // Bill & Reference doesn't exist for an Advance Payment — see
+    // app/api/submit/route.ts for the same dual-representation reasoning.
+    const billNo = values.isAdvance
+      ? (values.billNo ?? advanceNo ?? serialNo)
+      : values.paymentMode === "CASH"
+        ? (values.billNo ?? "")
+        : values.billNo!;
+    const billDate = values.isAdvance || values.paymentMode === "CASH" ? (values.billDate ?? formDate) : values.billDate!;
+
+    await db.transaction(async (tx) => {
+      await tx
+        .update(paymentAdvices)
+        .set({
+          formDate,
+          serialNo,
+          // A resubmission is a materially new submission — the Authority's
+          // prior recommend/reject decision no longer applies, and a fresh
+          // token is issued so an already-actioned link can't be reused to
+          // silently reopen the old decision on the new content.
+          authorityApprovedAt: null,
+          authorityRejectedAt: null,
+          authorityRemarks: null,
+          authorityToken,
+          authorityTokenExpiresAt,
+          // Same reasoning as the authority fields above: a resubmission is
+          // materially new content, so any Finance review already done on
+          // the previous version no longer applies.
+          financeReceivedAt: null,
+          verifiedAt: null,
+          verifiedBy: null,
+          sanctionedAt: null,
+          sanctionedBy: null,
+          vendorId: values.vendorId ?? null,
+          payeeName: values.payeeName,
+          payeeAddress: values.payeeAddress ?? "",
+          payeeEmail: values.payeeEmail ?? null,
+          payeeContactPerson: values.payeeContactPerson ?? null,
+          payeeContactPhone: values.payeeContactPhone ?? null,
+          payeeGstin: values.payeeGstin ?? null,
+          payeeUdyamNumber: values.payeeUdyamNumber ?? null,
+          poNumber: values.poNumber ?? null,
+          poDate: values.poDate ?? null,
+          deliveryChallanNo: values.deliveryChallanNo ?? null,
+          deliveryChallanDate: values.deliveryChallanDate ?? null,
+          billNo,
+          billDate,
+          amount: values.amount.toFixed(2),
+          basicAmount:
+            values.paymentMode === "NEFT" && !values.isAdvance
+              ? values.basicAmount!.toFixed(2)
+              : null,
+          gstAmount:
+            values.paymentMode === "NEFT" && !values.isAdvance
+              ? values.gstAmount!.toFixed(2)
+              : null,
+          natureOfExpenditure: values.isAdvance
+            ? values.purposeOfAdvance ?? ""
+            : values.paymentMode === "CASH"
+              ? values.cashVoucherItems.map((item) => item.description).join("; ")
+              : values.natureOfExpenditure ?? "",
+          enclosures: values.enclosures ?? null,
+          specialRemarks: values.specialRemarks ?? null,
+          paymentMode: values.paymentMode,
+          cashVoucherNo,
+          isAdvance: values.isAdvance,
+          advanceNo,
+          purposeOfAdvance: values.isAdvance ? values.purposeOfAdvance ?? null : null,
+          previousPendingAdvanceAmount: values.isAdvance
+            ? values.previousPendingAdvanceAmount.toFixed(2)
+            : null,
+          previousPendingAdvanceSince: values.isAdvance
+            ? values.previousPendingAdvanceSince ?? null
+            : null,
+          bankAccountNo: values.bankAccountNo ?? null,
+          bankIfsc: values.bankIfsc ?? null,
+          beneficiaryName: values.beneficiaryName ?? null,
+          bankName: values.bankName ?? null,
+          bankDetailsMismatch: values.bankDetailsMismatch,
+          submittedByName: values.submittedByName,
+          submittedByEmail: values.submittedByEmail,
+          submittedByDepartment: values.submittedByDepartment,
+          branch: values.branch,
+          recommendingAuthorityId: values.recommendingAuthorityId,
+          status: "SUBMITTED",
+          revisionCount: advice.revisionCount + 1,
+          editToken: null,
+          editTokenExpiresAt: null,
+          updatedAt: now,
+        })
+        .where(eq(paymentAdvices.id, advice.id));
+
+      if (values.paymentMode === "NEFT" && !values.isAdvance && !values.isNewVendorRequest) {
+        await captureVendorBankAccount(tx, {
+          vendorId: values.vendorId!,
+          bankAccountNo: values.bankAccountNo!,
+          bankIfsc: values.bankIfsc!,
+          beneficiaryName: values.beneficiaryName!,
+          sourceAdviceId: advice.id,
+          usedAt: now,
+        });
+      }
+
+      for (const docType of DOC_TYPES) {
+        if (docType === "CASH_VOUCHER_BILL") continue;
+        if (byDocType[docType].length === 0) continue;
+        const oldOnes = existingByDocType.get(docType) ?? [];
+        if (oldOnes.length === 0) continue;
+        oldBlobPathnamesToDelete.push(...oldOnes.map((o) => o.blobPathname));
+        await tx
+          .delete(attachments)
+          .where(and(eq(attachments.paymentAdviceId, advice.id), eq(attachments.docType, docType)));
+      }
+
+      await tx
+        .delete(cashVoucherItems)
+        .where(eq(cashVoucherItems.paymentAdviceId, advice.id));
+
+      const staleCashAttachments = existingAttachments.filter(
+        (attachment) => attachment.docType === "CASH_VOUCHER_BILL" && !retainedCashAttachmentIds.has(attachment.id),
+      );
+      if (staleCashAttachments.length > 0) {
+        oldBlobPathnamesToDelete.push(...staleCashAttachments.map((attachment) => attachment.blobPathname));
+        for (const attachment of staleCashAttachments) {
+          await tx.delete(attachments).where(eq(attachments.id, attachment.id));
+        }
+      }
+
+      if (newAttachmentRecords.length > 0) {
+        await tx.insert(attachments).values(
+          newAttachmentRecords.map((a) => ({
+            id: a.id,
+            paymentAdviceId: advice.id,
+            docType: a.docType,
+            fileName: a.fileName,
+            blobPathname: a.blobPathname,
+            blobUrl: a.blobUrl,
+            sizeBytes: a.sizeBytes,
+          })),
+        );
+      }
+      if (values.paymentMode === "CASH" && !values.isAdvance) {
+        await tx.insert(cashVoucherItems).values(
+          values.cashVoucherItems.map((item, sortOrder) => ({
+            paymentAdviceId: advice.id,
+            billNo: item.billNo ?? null,
+            billDate: item.billDate ?? null,
+            attachmentId: newCashBillIds.get(item.clientKey) ?? (item.id ? oldCashAttachmentIdByItemId.get(item.id) : undefined),
+            description: item.description,
+            amount: item.amount.toFixed(2),
+            sortOrder,
+          })),
+        );
+      }
+
+      await tx
+        .delete(advanceParticulars)
+        .where(eq(advanceParticulars.paymentAdviceId, advice.id));
+      if (values.isAdvance) {
+        await tx.insert(advanceParticulars).values(
+          values.advanceParticulars.map((item, sortOrder) => ({
+            paymentAdviceId: advice.id,
+            description: item.description,
+            amount: item.amount.toFixed(2),
+            sortOrder,
+          })),
+        );
+      }
+
+      if (values.isNewVendorRequest) {
+        if (advice.pendingVendorRequestId) {
+          // Most common case: Finance sent back this very vendor request
+          // (see lib/advice/vendor-requests.ts) and the submitter is now
+          // correcting it - update the existing row in place rather than
+          // creating a second one, and clear its sent-back markers since
+          // it's live for review again, same reset the PA's own
+          // authority/finance fields get above.
+          await tx
+            .update(vendorRequests)
+            .set({
+              requestedName: values.payeeName,
+              requestedAddress: values.payeeAddress ?? "",
+              requestedGstin: values.payeeGstin ?? null,
+              requestedVendorEmail: values.vendorRequestVendorEmail!,
+              msmeStatus: values.vendorRequestMsmeStatus,
+              msmeDocumentUrl: vendorRequestMsmeDocument?.blobUrl ?? null,
+              msmeDocumentType: values.vendorRequestMsmeDocumentType ?? null,
+              msmeEmailSentAt: values.vendorRequestMsmeEmailSentAt
+                ? new Date(values.vendorRequestMsmeEmailSentAt)
+                : null,
+              msmeEmailMessageId: values.vendorRequestMsmeEmailMessageId ?? null,
+              sentBackAt: null,
+              sentBackBy: null,
+              sentBackRemarks: null,
+            })
+            .where(eq(vendorRequests.id, advice.pendingVendorRequestId));
+
+          await tx.insert(auditLog).values({
+            paymentAdviceId: advice.id,
+            vendorRequestId: advice.pendingVendorRequestId,
+            action: "VENDOR_REQUEST_SUBMITTED",
+            actor: values.submittedByName,
+            ipAddress: clientIp(req),
+            details: { requestedName: values.payeeName, resubmission: true },
+          });
+        } else {
+          // Less common: this PA originally had a real vendor (or no
+          // vendor request at all) and only now, on resubmission, does the
+          // submitter ask for a new vendor to be added - same creation
+          // path as a fresh submission.
+          const [request] = await tx
+            .insert(vendorRequests)
+            .values({
+              requestedName: values.payeeName,
+              requestedAddress: values.payeeAddress ?? "",
+              requestedGstin: values.payeeGstin ?? null,
+              requestedVendorEmail: values.vendorRequestVendorEmail!,
+              msmeStatus: values.vendorRequestMsmeStatus,
+              msmeDocumentUrl: vendorRequestMsmeDocument?.blobUrl ?? null,
+              msmeDocumentType: values.vendorRequestMsmeDocumentType ?? null,
+              requestedByName: values.submittedByName,
+              requestedByEmail: values.submittedByEmail,
+              paymentAdviceId: advice.id,
+              msmeEmailSentAt: values.vendorRequestMsmeEmailSentAt
+                ? new Date(values.vendorRequestMsmeEmailSentAt)
+                : null,
+              msmeEmailMessageId: values.vendorRequestMsmeEmailMessageId ?? null,
+            })
+            .returning({ id: vendorRequests.id });
+
+          await tx
+            .update(paymentAdvices)
+            .set({ pendingVendorRequestId: request.id })
+            .where(eq(paymentAdvices.id, advice.id));
+
+          await tx.insert(auditLog).values({
+            paymentAdviceId: advice.id,
+            vendorRequestId: request.id,
+            action: "VENDOR_REQUEST_SUBMITTED",
+            actor: values.submittedByName,
+            ipAddress: clientIp(req),
+            details: { requestedName: values.payeeName },
+          });
+        }
+      } else if (advice.pendingVendorRequestId) {
+        // Submitter switched away from the pending vendor request on
+        // resubmit (e.g. picked a real vendor instead) - detach it from
+        // this PA so a later approval can't silently overwrite the vendor
+        // this PA now actually uses. The vendor_requests row itself is
+        // left as-is for the audit trail; approveVendorRequest's own guard
+        // refuses to act on a request that's no longer the PA's current
+        // pending one.
+        await tx
+          .update(paymentAdvices)
+          .set({ pendingVendorRequestId: null })
+          .where(eq(paymentAdvices.id, advice.id));
+      }
+
+      await tx.insert(auditLog).values({
+        paymentAdviceId: advice.id,
+        action: "RESUBMITTED",
+        actor: values.submittedByName,
+        ipAddress: clientIp(req),
+        details: { serialNo, revisionCount: advice.revisionCount + 1 },
+      });
+    });
+
+    await Promise.allSettled(oldBlobPathnamesToDelete.map((p) => del(p)));
+
+    const [authority] = await db
+      .select({ authorityName: recommendingAuthorities.authorityName, email: recommendingAuthorities.email })
+      .from(recommendingAuthorities)
+      .where(eq(recommendingAuthorities.id, values.recommendingAuthorityId))
+      .limit(1);
+    const origin = new URL(req.url).origin;
+    const authorityName = authority?.authorityName ?? DEPARTMENT_NAME;
+    await notifyAuthorityApproval(
+      {
+        displayNo: displayNoFor(
+          values.paymentMode,
+          serialNo,
+          cashVoucherNo,
+          values.isAdvance,
+          advanceNo,
+        ),
+        documentLabel: documentLabelFor(values.paymentMode, values.isAdvance),
+        authorityName,
+        submittedByName: values.submittedByName,
+        payeeName: values.payeeName,
+        amount: values.amount.toLocaleString("en-IN", { minimumFractionDigits: 2 }),
+        natureOfExpenditure: values.isAdvance
+          ? values.purposeOfAdvance ?? ""
+          : values.paymentMode === "CASH"
+            ? values.cashVoucherItems.map((item) => item.description).join("; ")
+            : values.natureOfExpenditure ?? "",
+        billReference: billNo,
+        paymentMode: values.paymentMode,
+        formDate,
+        approvalLink: `${origin}/authority-approval/${authorityToken}`,
+        revisionCount: advice.revisionCount + 1,
+        previousRemarks: advice.adminRemarks,
+      },
+      authority?.email ?? null,
+      advice.id,
+    );
+
+    return NextResponse.json({
+      serialNo,
+      cashVoucherNo,
+      advanceNo,
+      id: advice.id,
+      authorityToken,
+      authorityName,
+    });
+  } catch (err) {
+    console.error("Resubmit failed after blob upload, cleaning up", err);
+    await Promise.allSettled(uploadedPathnames.map((p) => del(p)));
+    return NextResponse.json(
+      { error: "Something went wrong while saving your resubmission. Please try again." },
+      { status: 500 },
+    );
+  }
+}

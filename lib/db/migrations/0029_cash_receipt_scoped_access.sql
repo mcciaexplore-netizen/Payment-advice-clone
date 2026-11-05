@@ -1,0 +1,2 @@
+ALTER TABLE "admin_user_roles" DROP CONSTRAINT "admin_user_roles_scope_value_check";--> statement-breakpoint
+ALTER TABLE "admin_user_roles" ADD CONSTRAINT "admin_user_roles_scope_value_check" CHECK (("admin_user_roles"."role" in ('BRANCH', 'DEPARTMENT', 'CASH_RECEIPT') and "admin_user_roles"."scope_value" is not null) or ("admin_user_roles"."role" not in ('BRANCH', 'DEPARTMENT', 'CASH_RECEIPT') and "admin_user_roles"."scope_value" is null));

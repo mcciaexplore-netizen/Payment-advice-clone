@@ -1,0 +1,190 @@
+import Link from "next/link";
+import { and, count, eq, sum } from "drizzle-orm";
+import { getAdminSession } from "@/lib/admin-session";
+import { defaultPaymentModeForRoles } from "@/lib/admin/role-scope";
+import { buildTabCondition } from "@/lib/admin/filters";
+import { PipelineSummary, PIPELINE_SUMMARY_STAGES } from "@/components/admin/PipelineSummary";
+import { CashReceiptsSection } from "@/components/admin/CashReceiptsSection";
+import { db } from "@/lib/db";
+import { paymentAdvices } from "@/lib/db/schema";
+import { financialYearFor } from "@/lib/serial";
+import { getVendorReviewCount } from "@/lib/advice/vendor-review";
+import {
+  addCalendarDays,
+  calendarDayOfWeek,
+  calendarDaysBetween,
+  formatDateOnlyShort,
+  todayInIst,
+} from "@/lib/date-time";
+import { isModuleEnabled } from "@/lib/config";
+
+export const dynamic = "force-dynamic";
+
+function money(value: number) {
+  return `₹ ${value.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+export default async function AdminDashboardPage() {
+  const session = await getAdminSession();
+  if (!session) return null;
+
+  const roleMode = defaultPaymentModeForRoles(session.roles);
+  const roleScope = roleMode ? eq(paymentAdvices.paymentMode, roleMode) : undefined;
+  const financialYear = financialYearFor(new Date());
+
+  const [stageRows, analyticsRows, vendorReviewCount] = await Promise.all([
+    Promise.all(PIPELINE_SUMMARY_STAGES.map(async ({ tab }) => {
+      const [result] = await db.select({ count: count(), sum: sum(paymentAdvices.amount) })
+        .from(paymentAdvices)
+        .where(and(roleScope, buildTabCondition(tab)));
+      return { tab, count: result?.count ?? 0, sum: Number(result?.sum ?? 0) };
+    })),
+    db.select({
+      submittedAt: paymentAdvices.submittedAt,
+      authorityApprovedAt: paymentAdvices.authorityApprovedAt,
+      payeeName: paymentAdvices.payeeName,
+      amount: paymentAdvices.amount,
+      totalPaid: paymentAdvices.totalPaid,
+      paymentMode: paymentAdvices.paymentMode,
+      isAdvance: paymentAdvices.isAdvance,
+      paymentDoneAt: paymentAdvices.paymentDoneAt,
+    }).from(paymentAdvices).where(and(roleScope, eq(paymentAdvices.financialYear, financialYear))),
+    getVendorReviewCount(),
+  ]);
+
+  const now = new Date();
+  const today = todayInIst(now);
+  const weekStart = addCalendarDays(today, -calendarDayOfWeek(today) - 12 * 7);
+  const weeks = Array.from({ length: 13 }, (_, index) => {
+    const start = addCalendarDays(weekStart, index * 7);
+    return { start, count: 0 };
+  });
+
+  const modes = {
+    NEFT: { label: "NEFT", count: 0, amount: 0 },
+    CASH: { label: "Cash", count: 0, amount: 0 },
+    ADVANCE: { label: "Advance Payment", count: 0, amount: 0 },
+  };
+  const vendors = new Map<string, { count: number; amount: number }>();
+  let approvalMilliseconds = 0;
+  let approvalCount = 0;
+  let totalSubmitted = 0;
+  let totalPaid = 0;
+
+  for (const row of analyticsRows) {
+    const amount = Number(row.amount);
+    totalSubmitted += amount;
+    const paid = row.paymentMode === "CASH"
+      ? row.paymentDoneAt ? amount : 0
+      : Math.min(Number(row.totalPaid), amount);
+    totalPaid += paid;
+
+    const mode = row.isAdvance ? modes.ADVANCE : row.paymentMode === "CASH" ? modes.CASH : modes.NEFT;
+    mode.count += 1;
+    mode.amount += amount;
+
+    const vendor = vendors.get(row.payeeName) ?? { count: 0, amount: 0 };
+    vendor.count += 1;
+    vendor.amount += amount;
+    vendors.set(row.payeeName, vendor);
+
+    if (row.authorityApprovedAt) {
+      approvalMilliseconds += Math.max(0, row.authorityApprovedAt.getTime() - row.submittedAt.getTime());
+      approvalCount += 1;
+    }
+
+    const weekIndex = Math.floor(calendarDaysBetween(weekStart, todayInIst(row.submittedAt)) / 7);
+    if (weekIndex >= 0 && weekIndex < weeks.length) weeks[weekIndex].count += 1;
+  }
+
+  const topVendors = [...vendors.entries()]
+    .sort(([, a], [, b]) => b.amount - a.amount)
+    .slice(0, 5);
+  const maxWeeklyCount = Math.max(1, ...weeks.map((week) => week.count));
+  const averageApprovalHours = approvalCount ? approvalMilliseconds / approvalCount / 3_600_000 : null;
+
+  return (
+    <div className="flex flex-col gap-8">
+      <header>
+        <h1 className="font-heading text-3xl text-brand">Dashboard</h1>
+        <p className="mt-1 text-sm text-gray-600">
+          {roleMode ? `${roleMode}-focused overview` : "All submissions overview"} · Financial year {financialYear}
+        </p>
+      </header>
+
+      <PipelineSummary
+        metrics={stageRows}
+        hrefFor={(tab) => `/admin/submissions?tab=${tab}${roleMode ? `&paymentMode=${roleMode}` : ""}`}
+      />
+
+      <section className="flex flex-col justify-between gap-4 rounded-lg border border-amber-300 bg-amber-50 p-5 sm:flex-row sm:items-center">
+        <div>
+          <h2 className="font-heading text-xl text-brand">Vendor Review Queue</h2>
+          <p className="mt-1 text-sm text-amber-950">
+            {vendorReviewCount} historical Payment Advice submission{vendorReviewCount === 1 ? "" : "s"}
+            {" "}need{vendorReviewCount === 1 ? "s" : ""} a canonical vendor link.
+          </p>
+        </div>
+        <Link
+          href="/admin/vendor-requests?tab=review"
+          className="w-fit rounded-md bg-brand px-4 py-2 text-sm font-medium text-white"
+        >
+          Review vendors
+        </Link>
+      </section>
+
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        <Panel title="Submissions over time" subtitle="Weekly count · last 90 days">
+          <div className="flex h-48 items-end gap-2 border-b border-gray-200 pt-6">
+            {weeks.map((week) => <div key={week.start} className="flex min-w-0 flex-1 flex-col items-center justify-end gap-2">
+              <span className="text-xs font-medium text-brand">{week.count || ""}</span>
+              <div className="w-full rounded-t bg-[#2e8b57]" style={{ height: `${Math.max(week.count ? 8 : 2, (week.count / maxWeeklyCount) * 120)}px` }} />
+              <span className="hidden text-[10px] text-gray-500 sm:block">{formatDateOnlyShort(week.start)}</span>
+            </div>)}
+          </div>
+        </Panel>
+
+        <Panel title="Breakdown by payment type" subtitle="Current financial year">
+          <div className="divide-y divide-gray-100">
+            {Object.values(modes).map((mode) => <div key={mode.label} className="flex items-center justify-between gap-4 py-4 first:pt-0 last:pb-0">
+              <div><p className="font-medium text-brand">{mode.label}</p><p className="text-xs text-gray-500">{mode.count} submission{mode.count === 1 ? "" : "s"}</p></div>
+              <p className="font-heading text-xl text-brand">{money(mode.amount)}</p>
+            </div>)}
+          </div>
+        </Panel>
+
+        <Panel title="Top vendors by amount" subtitle={`Top 5 · ${financialYear}`}>
+          {topVendors.length ? <ol className="divide-y divide-gray-100">{topVendors.map(([name, value], index) => <li key={name} className="flex items-center justify-between gap-4 py-3 first:pt-0 last:pb-0"><div className="flex min-w-0 items-center gap-3"><span className="text-sm text-gray-400">{index + 1}</span><div className="min-w-0"><p className="truncate font-medium text-brand">{name}</p><p className="text-xs text-gray-500">{value.count} submission{value.count === 1 ? "" : "s"}</p></div></div><span className="whitespace-nowrap text-sm font-medium">{money(value.amount)}</span></li>)}</ol> : <Empty />}
+        </Panel>
+
+        <Panel title="Authority recommendation time" subtitle="Average for recommended submissions this financial year">
+          <p className="font-heading text-4xl text-brand">{averageApprovalHours === null ? "-" : averageApprovalHours < 48 ? `${averageApprovalHours.toFixed(1)} hrs` : `${(averageApprovalHours / 24).toFixed(1)} days`}</p>
+          <p className="mt-2 text-sm text-gray-500">Based on {approvalCount} recommended submission{approvalCount === 1 ? "" : "s"}.</p>
+        </Panel>
+      </div>
+
+      <section>
+        <h2 className="mb-3 font-heading text-xl text-brand">Financial Year Totals</h2>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+          <TotalCard label="Submitted" value={totalSubmitted} detail={`${analyticsRows.length} submissions`} />
+          <TotalCard label="Paid / Settled" value={totalPaid} detail="Cash completed + NEFT payments recorded" />
+          <TotalCard label="Still Pending" value={Math.max(0, totalSubmitted - totalPaid)} detail="Submitted amount less paid / settled" />
+        </div>
+      </section>
+
+      {isModuleEnabled("cashReceipt") ? <CashReceiptsSection searchParams={{}} baseHref="/admin/cash-receipts" limit={10} viewAllHref="/admin/cash-receipts" /> : null}
+    </div>
+  );
+}
+
+function Panel({ title, subtitle, children }: { title: string; subtitle: string; children: React.ReactNode }) {
+  return <section className="rounded-lg border border-gray-200 bg-white p-5"><h2 className="font-heading text-xl text-brand">{title}</h2><p className="mb-5 text-xs text-gray-500">{subtitle}</p>{children}</section>;
+}
+
+function TotalCard({ label, value, detail }: { label: string; value: number; detail: string }) {
+  return <div className="rounded-lg border border-gray-200 bg-white p-5"><p className="text-xs font-medium uppercase tracking-wide text-gray-500">{label}</p><p className="mt-2 font-heading text-3xl text-brand">{money(value)}</p><p className="mt-1 text-xs text-gray-500">{detail}</p></div>;
+}
+
+function Empty() {
+  return <p className="text-sm text-gray-500">No submissions in this financial year.</p>;
+}

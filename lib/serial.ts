@@ -1,0 +1,164 @@
+import { sql } from "drizzle-orm";
+import type { Database } from "./db";
+import { serialCounters } from "./db/schema";
+import { istCalendarParts } from "./date-time";
+import { SERIAL_ORG_CODE } from "@/lib/branding";
+
+// Accepts either the top-level db handle or a transaction callback's `tx`
+// argument — both expose `.execute()`, which is all this module needs.
+type Executor = Pick<Database, "execute">;
+
+const PAYMENT_ADVICE_SERIES = "PAYMENT_ADVICE";
+const CASH_VOUCHER_SERIES = "CASH_VOUCHER";
+const ADVANCE_SERIES = "ADVANCE";
+const FORWARDING_MEMO_SERIES = "FORWARDING_MEMO";
+const REFUND_SERIES = "REFUND";
+
+/**
+ * Indian financial year runs 1 April -> 31 March.
+ * Jan-Mar belong to the FY that started the previous calendar year.
+ */
+export function financialYearFor(date: Date): string {
+  const { year, month } = istCalendarParts(date);
+  const startYear = month >= 4 ? year : year - 1;
+  const endYearShort = String((startYear + 1) % 100).padStart(2, "0");
+  return `${startYear}-${endYearShort}`;
+}
+
+export function formatSerial(financialYear: string, number: number): string {
+  return `${SERIAL_ORG_CODE}/${financialYear}/${String(number).padStart(4, "0")}`;
+}
+
+export function formatCashVoucherNo(financialYear: string, number: number): string {
+  return `CASH/${SERIAL_ORG_CODE}/${financialYear}/${String(number).padStart(4, "0")}`;
+}
+
+export function formatAdvanceNo(financialYear: string, number: number): string {
+  return `ADV/${SERIAL_ORG_CODE}/${financialYear}/${String(number).padStart(4, "0")}`;
+}
+
+export function formatForwardingMemoNo(financialYear: string, number: number): string {
+  return `FM/${SERIAL_ORG_CODE}/${financialYear}/${String(number).padStart(4, "0")}`;
+}
+
+export function formatRefundNo(financialYear: string, number: number): string {
+  return `REF/${SERIAL_ORG_CODE}/${financialYear}/${String(number).padStart(4, "0")}`;
+}
+
+/**
+ * Allocates the next number for the given (financial year, series) pair.
+ * Must run inside a transaction; locks the counter row with SELECT ... FOR
+ * UPDATE so concurrent submits never collide, and upserts the row if the
+ * (financial year, series) pair doesn't exist yet. Shared by both the
+ * PAYMENT_ADVICE and CASH_VOUCHER series — one allocation mechanism, two
+ * independent counters.
+ */
+async function allocateNumber(
+  tx: Executor,
+  financialYear: string,
+  series: string,
+): Promise<number> {
+  await tx.execute(sql`
+    insert into ${serialCounters} (financial_year, series, last_number)
+    values (${financialYear}, ${series}, 0)
+    on conflict (financial_year, series) do nothing
+  `);
+
+  const rows = await tx.execute<{ last_number: number }>(sql`
+    select last_number from ${serialCounters}
+    where financial_year = ${financialYear} and series = ${series}
+    for update
+  `);
+
+  const currentLast = Number(rows.rows[0].last_number);
+  const nextNumber = currentLast + 1;
+
+  await tx.execute(sql`
+    update ${serialCounters}
+    set last_number = ${nextNumber}
+    where financial_year = ${financialYear} and series = ${series}
+  `);
+
+  return nextNumber;
+}
+
+/** Allocates the next Payment Advice number (PD/<FY>/NNNN) for regular
+ * NEFT submissions. Cash Vouchers and Advances use their independent series. */
+export async function allocateSerialNumber(
+  tx: Executor,
+  date: Date,
+): Promise<{ serialNo: string; financialYear: string }> {
+  const financialYear = financialYearFor(date);
+  return {
+    serialNo: await allocatePaymentAdviceNumber(tx, financialYear),
+    financialYear,
+  };
+}
+
+/** Allocates from the regular-NEFT series for an already-known financial year. */
+export async function allocatePaymentAdviceNumber(
+  tx: Executor,
+  financialYear: string,
+): Promise<string> {
+  const nextNumber = await allocateNumber(tx, financialYear, PAYMENT_ADVICE_SERIES);
+  return formatSerial(financialYear, nextNumber);
+}
+
+/** Allocates the next Cash Voucher number (CASH/PD/<FY>/NNNN) — CASH-mode
+ * submissions only, independent counter from the main serial number. */
+export async function allocateCashVoucherNumber(
+  tx: Executor,
+  financialYear: string,
+): Promise<string> {
+  const nextNumber = await allocateNumber(tx, financialYear, CASH_VOUCHER_SERIES);
+  return formatCashVoucherNo(financialYear, nextNumber);
+}
+
+/** Allocates the next Advance number (ADV/PD/<FY>/NNNN) — isAdvance = true
+ * submissions only, one shared counter regardless of whether the advance
+ * routes to NEFT or Cash (not two separate ADV series). Independent from
+ * both the main serial number and the Cash Voucher number. */
+export async function allocateAdvanceNumber(
+  tx: Executor,
+  financialYear: string,
+): Promise<string> {
+  const nextNumber = await allocateNumber(tx, financialYear, ADVANCE_SERIES);
+  return formatAdvanceNo(financialYear, nextNumber);
+}
+
+/** Allocates the next Forwarding Memo number (FM/PD/<FY>/NNNN) — its own
+ * independent series, same gapless SELECT ... FOR UPDATE mechanism as the
+ * other three. Forwarding Memos never touch any of the other three counters. */
+export async function allocateForwardingMemoNumber(
+  tx: Executor,
+  financialYear: string,
+): Promise<string> {
+  const nextNumber = await allocateNumber(tx, financialYear, FORWARDING_MEMO_SERIES);
+  return formatForwardingMemoNo(financialYear, nextNumber);
+}
+
+/** Allocates Refund request numbers on their own gapless series. */
+export async function allocateRefundNumber(
+  tx: Executor,
+  financialYear: string,
+): Promise<string> {
+  const nextNumber = await allocateNumber(tx, financialYear, REFUND_SERIES);
+  return formatRefundNo(financialYear, nextNumber);
+}
+
+/** Allocates the next Cash Receipt number for a given branch — one
+ * independent gapless series per branch, not one shared series across all
+ * branches, since each branch's receipt book is numbered on its own. Same
+ * SELECT ... FOR UPDATE primitive as every other series here; the
+ * per-branch scoping lives entirely in the series key
+ * ("CASH_RECEIPT:<branch name>"), not in a second allocation mechanism.
+ * Returns the raw sequence number - pass it to formatCashReceiptNumber()
+ * (lib/cash-receipt-number.ts) for the branch-coded display string
+ * (CR/<branchCode>/<FY>/NNNN). */
+export async function allocateCashReceiptNumber(
+  tx: Executor,
+  financialYear: string,
+  branch: string,
+): Promise<number> {
+  return allocateNumber(tx, financialYear, `CASH_RECEIPT:${branch}`);
+}

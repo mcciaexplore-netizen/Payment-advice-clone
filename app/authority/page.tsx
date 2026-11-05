@@ -1,0 +1,388 @@
+import Link from "next/link";
+import { and, count, desc, eq, gte, inArray, isNotNull, isNull, lte, or, sql, sum } from "drizzle-orm";
+import { db } from "@/lib/db";
+import { adminUserRoles, adminUsers, attachments, cashReceipts, paymentAdvices, paymentEntries, recommendingAuthorities } from "@/lib/db/schema";
+import { getAdminSession } from "@/lib/admin-session";
+import { displayNoFor } from "@/lib/advice/document-identity";
+import { pipelineStageFor } from "@/lib/advice/pipeline-stage";
+import { StageBadge } from "@/components/admin/StageBadge";
+import { StageLegend } from "@/components/admin/StageLegend";
+import { PaymentMode } from "@/lib/validation/payment-advice";
+import { addCalendarDays, formatDateOnly, formatIstDate, todayInIst } from "@/lib/date-time";
+import { parseReportRange } from "@/lib/cash-receipt-report";
+import { CashReceiptReportBar } from "@/components/account/CashReceiptReportBar";
+import { buildTabCondition } from "@/lib/admin/filters";
+import { PIPELINE_SUMMARY_STAGES } from "@/components/admin/PipelineSummary";
+import { stageFilterLabel } from "@/lib/advice/dashboard-filters";
+import { StageAgingIndicator } from "@/components/admin/StageAgingIndicator";
+import { compareByCurrentStageAge } from "@/lib/advice/stage-aging";
+import { DgExecutiveDashboard } from "@/components/admin/DgExecutiveDashboard";
+import { buildDgSummaryMetrics, calculateDgIntervalMetrics } from "@/lib/advice/dg-dashboard";
+import { submissionPdfHref, submissionPdfLabel } from "@/lib/advice/submission-pdf";
+import { cashReceiptStatusText } from "@/lib/cash-receipts/status";
+import { SubmissionDownloadButtons, type SubmissionAttachment } from "@/components/admin/SubmissionDownloadButtons";
+import { SubmitterEditAction } from "@/components/admin/SubmitterEditAction";
+import { DashboardFilters, FilteredEmptyState } from "@/components/dashboard/DashboardFilters";
+import { dashboardCountFields, dashboardFilterCondition, hasActiveFilters, parseDashboardFilters, readDashboardCounts } from "@/lib/advice/dashboard-filters";
+import { isModuleEnabled, isExecutiveAuthority } from "@/lib/config";
+
+export const dynamic = "force-dynamic";
+
+type AuthorityView = "pending" | "history" | "my-submissions";
+type TeamView = "team-submissions" | "my-submissions" | "cash-receipts";
+type DashboardRole = "AUTHORITY" | "BRANCH" | "DEPARTMENT" | "SELF" | "CASH_RECEIPT";
+type DashboardGrant = { role: DashboardRole; recommendingAuthorityId: string | null; scopeValue: string | null };
+
+function date(value: Date | string) { return formatIstDate(value); }
+function caseInsensitiveEq(column: typeof paymentAdvices.branch | typeof paymentAdvices.submittedByDepartment, value: string) {
+  return sql`lower(${column}) = lower(${value})`;
+}
+function isDashboardRole(value: string | undefined): value is DashboardRole {
+  return value === "AUTHORITY" || value === "BRANCH" || value === "DEPARTMENT" || value === "SELF" || value === "CASH_RECEIPT";
+}
+function roleLabel(grant: DashboardGrant): string {
+  return grant.role === "AUTHORITY" ? "Recommendations"
+    : grant.role === "SELF" ? "My Submissions"
+    : grant.role === "CASH_RECEIPT" ? `Cash Receipts: ${grant.scopeValue}`
+    : `${grant.role === "BRANCH" ? "Branch" : "Department"}: ${grant.scopeValue}`;
+}
+
+export default async function TeamDashboard({ searchParams }: { searchParams: Promise<{ view?: string; role?: string; stage?: string; decision?: string; q?: string; dateFrom?: string; dateTo?: string }> }) {
+  const session = await getAdminSession();
+  if (!session) return null;
+  const [accounts, roleRows, authorityRows] = await Promise.all([
+    db.select({ email: adminUsers.email }).from(adminUsers).where(eq(adminUsers.id, session.adminUserId)).limit(1),
+    db.select({ role: adminUserRoles.role, recommendingAuthorityId: adminUserRoles.recommendingAuthorityId, scopeValue: adminUserRoles.scopeValue })
+      .from(adminUserRoles).where(eq(adminUserRoles.adminUserId, session.adminUserId)),
+    session.recommendingAuthorityId
+      ? db.select({ authorityName: recommendingAuthorities.authorityName }).from(recommendingAuthorities)
+          .where(eq(recommendingAuthorities.id, session.recommendingAuthorityId)).limit(1)
+      : Promise.resolve([]),
+  ]);
+  const account = accounts[0];
+  if (!account) return null;
+  // A CASH_RECEIPT grant only becomes its own dashboard entry when the
+  // account does NOT also hold BRANCH - a BRANCH holder already gets full
+  // Team Submissions plus the Cash Receipts tab below, so a second,
+  // more-restricted CASH_RECEIPT entry would be redundant and confusing.
+  // This keeps "BRANCH holders keep exactly what they have today" true
+  // regardless of whether they also hold CASH_RECEIPT. Likewise a SELF
+  // holder's My Submissions view already carries the Cash Receipts tab when
+  // they hold CASH_RECEIPT, so SELF + CASH_RECEIPT (Advika, Dnyaneshwar) is
+  // one tab bar - My Submissions | My Cash Receipts - not two role entries.
+  const holdsBranchGrant = roleRows.some((row) => row.role === "BRANCH" && Boolean(row.scopeValue));
+  const holdsSelfGrant = roleRows.some((row) => row.role === "SELF");
+  const holdsCashReceiptGrant = roleRows.some((row) => row.role === "CASH_RECEIPT" && Boolean(row.scopeValue));
+  const grants = roleRows.filter((row): row is DashboardGrant =>
+    (row.role === "AUTHORITY" && Boolean(row.recommendingAuthorityId)) ||
+    ((row.role === "BRANCH" || row.role === "DEPARTMENT") && Boolean(row.scopeValue)) ||
+    row.role === "SELF" ||
+    (row.role === "CASH_RECEIPT" && Boolean(row.scopeValue) && !holdsBranchGrant && !holdsSelfGrant),
+  );
+  if (grants.length === 0) return null;
+
+  const params = await searchParams;
+  const requestedRole = isDashboardRole(params.role) ? params.role : undefined;
+  const activeGrant = grants.find((grant) => grant.role === requestedRole) ?? grants[0];
+  const isAuthority = activeGrant.role === "AUTHORITY";
+  // SELF and CASH_RECEIPT (2026-10-07) have no broader "team" to show -
+  // every view is My Submissions or My Cash Receipts, never Team
+  // Submissions and never the branch/department-wide pipeline summary,
+  // regardless of the ?view= param. The Team Submissions tab is hidden
+  // entirely for both, not just blocked server-side - there is nothing to
+  // toggle to.
+  const isRestrictedGrant = activeGrant.role === "SELF" || activeGrant.role === "CASH_RECEIPT";
+  // BRANCH keeps exactly today's behavior: Team Submissions, My
+  // Submissions, and the Cash Receipts tab. CASH_RECEIPT-only grants get
+  // the same Cash Receipts tab (same loadCashReceiptsTab, same
+  // issuedByUserId-scoped query) but never Team Submissions - see
+  // isRestrictedGrant above.
+  const isBranchGrant = activeGrant.role === "BRANCH";
+  // A SELF-only account without CASH_RECEIPT never gets the tab.
+  const canSeeCashReceiptsTab = isModuleEnabled("cashReceipt") && (isBranchGrant || activeGrant.role === "CASH_RECEIPT" || (activeGrant.role === "SELF" && holdsCashReceiptGrant));
+  const isDg = isAuthority && isExecutiveAuthority(authorityRows[0]?.authorityName);
+  if (isDg && (!params.view || params.view === "executive")) return loadDgExecutiveDashboard();
+  const authorityView: AuthorityView = params.view === "history" ? "history" : params.view === "my-submissions" ? "my-submissions" : "pending";
+  // Cash Receipts is checked first so a restricted grant (SELF/CASH_RECEIPT)
+  // can still reach it; isRestrictedGrant then forces everything else to
+  // My Submissions, so Team Submissions is never reachable for them no
+  // matter what ?view= asks for - enforced here, in the server-computed
+  // view selection the query itself is built from, not just in the nav UI.
+  const teamView: TeamView = params.view === "cash-receipts" && canSeeCashReceiptsTab ? "cash-receipts"
+    : isRestrictedGrant || params.view === "my-submissions" ? "my-submissions"
+    : "team-submissions";
+  const view = isAuthority ? authorityView : teamView;
+
+  if (view === "cash-receipts") {
+    return loadCashReceiptsTab(activeGrant, grants, session.adminUserId, isRestrictedGrant, params);
+  }
+
+  const ownSubmissions = eq(paymentAdvices.submittedByEmail, account.email);
+  const authorityScope = eq(paymentAdvices.recommendingAuthorityId, activeGrant.recommendingAuthorityId!);
+  // teamScope is never actually consulted for a restricted grant (SELF or
+  // CASH_RECEIPT) - view can only ever be "my-submissions" or
+  // "cash-receipts" for them, both computed above without it - but it
+  // still defaults both to ownSubmissions rather than falling through to
+  // authorityScope, so a future code path can't accidentally compute a
+  // branch-wide or authority-wide query for one of them.
+  const teamScope = activeGrant.role === "BRANCH"
+    ? caseInsensitiveEq(paymentAdvices.branch, activeGrant.scopeValue!)
+    : activeGrant.role === "DEPARTMENT"
+      ? caseInsensitiveEq(paymentAdvices.submittedByDepartment, activeGrant.scopeValue!)
+      : activeGrant.role === "SELF" || activeGrant.role === "CASH_RECEIPT"
+        ? ownSubmissions
+        : authorityScope;
+  const scopeWhere = view === "my-submissions" ? ownSubmissions : isAuthority
+    ? and(authorityScope, view === "history"
+      ? or(isNotNull(paymentAdvices.authorityApprovedAt), isNotNull(paymentAdvices.authorityRejectedAt), eq(paymentAdvices.status, "REJECTED"))
+      : and(eq(paymentAdvices.status, "SUBMITTED"), isNull(paymentAdvices.authorityApprovedAt), isNull(paymentAdvices.authorityRejectedAt)))
+    : teamScope;
+  // Stage / Decision / search / date filters (History, My Submissions, Team
+  // Submissions; Pending My Recommendation has none). Always ANDed onto
+  // scopeWhere above, which is unchanged, so they only ever narrow it.
+  const filtersEnabled = view !== "pending";
+  const showDecision = isAuthority && view === "history";
+  const filters = filtersEnabled ? parseDashboardFilters(params, { decision: showDecision }) : {};
+  const filterBase = { role: activeGrant.role, view };
+  const filterCondition = dashboardFilterCondition(filters);
+  const where = filterCondition ? and(scopeWhere, filterCondition) : scopeWhere;
+
+  const [rawRows, countRows] = await Promise.all([
+    db.select({
+    id: paymentAdvices.id, serialNo: paymentAdvices.serialNo, cashVoucherNo: paymentAdvices.cashVoucherNo,
+    advanceNo: paymentAdvices.advanceNo, isAdvance: paymentAdvices.isAdvance, paymentMode: paymentAdvices.paymentMode,
+    payeeName: paymentAdvices.payeeName, amount: paymentAdvices.amount, nature: paymentAdvices.natureOfExpenditure,
+    submittedBy: paymentAdvices.submittedByName, submittedAt: paymentAdvices.submittedAt, status: paymentAdvices.status,
+    approvedAt: paymentAdvices.authorityApprovedAt, rejectedAt: paymentAdvices.authorityRejectedAt,
+    authorityRemarks: paymentAdvices.authorityRemarks, adminRemarks: paymentAdvices.adminRemarks,
+    editToken: paymentAdvices.editToken, editTokenExpiresAt: paymentAdvices.editTokenExpiresAt,
+    financeReceivedAt: paymentAdvices.financeReceivedAt, verifiedAt: paymentAdvices.verifiedAt,
+    paymentDoneAt: paymentAdvices.paymentDoneAt, totalPaid: paymentAdvices.totalPaid, revisionCount: paymentAdvices.revisionCount,
+    updatedAt: paymentAdvices.updatedAt, sentBackAt: paymentAdvices.sentBackAt,
+    finalRejectedAt: paymentAdvices.rejectedAt, finalRejectedBy: paymentAdvices.rejectedBy,
+    finalRejectionRemarks: paymentAdvices.rejectionRemarks,
+  }).from(paymentAdvices).where(where).orderBy(desc(paymentAdvices.submittedAt)),
+    // One query for every filter count, over the same scope as the table.
+    filtersEnabled ? db.select(dashboardCountFields(filters)).from(paymentAdvices).where(scopeWhere) : Promise.resolve([]),
+  ]);
+  const counts = readDashboardCounts(countRows[0]);
+  // Subtitles keep counting the whole tab, whatever the filters.
+  const scopeTotal = filtersEnabled ? counts.total : rawRows.length;
+
+  // The Download column (View / Download Attachment + the PDF) shows on My
+  // Submissions for every role and on a BRANCH/DEPARTMENT Team Submissions
+  // view. Only ids and file names are loaded here, never Blob URLs: the
+  // files themselves go through /api/advice/[id]/attachments/[attachmentId].
+  const showDownloads = view === "my-submissions" || view === "team-submissions";
+  const attachmentsByAdvice = new Map<string, SubmissionAttachment[]>();
+  const firstPaymentByAdvice = new Map<string, Date>();
+  if (rawRows.length > 0 && showDownloads) {
+    const files = await db.select({ id: attachments.id, adviceId: attachments.paymentAdviceId, fileName: attachments.fileName })
+      .from(attachments)
+      .where(inArray(attachments.paymentAdviceId, rawRows.map((row) => row.id)))
+      .orderBy(attachments.uploadedAt);
+    for (const file of files) {
+      const list = attachmentsByAdvice.get(file.adviceId) ?? [];
+      list.push({ id: file.id, fileName: file.fileName });
+      attachmentsByAdvice.set(file.adviceId, list);
+    }
+  }
+  if (rawRows.length > 0) {
+    const entries = await db.select({ adviceId: paymentEntries.paymentAdviceId, paidAt: paymentEntries.paidAt })
+      .from(paymentEntries)
+      .where(inArray(paymentEntries.paymentAdviceId, rawRows.map((row) => row.id)));
+    for (const entry of entries) {
+      const existing = firstPaymentByAdvice.get(entry.adviceId);
+      if (!existing || entry.paidAt < existing) firstPaymentByAdvice.set(entry.adviceId, entry.paidAt);
+    }
+  }
+  const rows = rawRows.map((row) => ({ ...row, firstPaymentAt: firstPaymentByAdvice.get(row.id) ?? null }));
+  if (!(isAuthority && view === "history")) {
+    rows.sort(compareByCurrentStageAge);
+  }
+
+  const subtitle = isAuthority
+    ? view === "history" ? "Your previous recommendation decisions"
+      : view === "my-submissions" ? `${scopeTotal} submission${scopeTotal === 1 ? "" : "s"} made using ${account.email}`
+      : `${rows.length} submission${rows.length === 1 ? "" : "s"} waiting for you`
+    : view === "my-submissions" ? `${scopeTotal} submission${scopeTotal === 1 ? "" : "s"} made using ${account.email}`
+      : `${scopeTotal} submission${scopeTotal === 1 ? "" : "s"} in ${activeGrant.scopeValue}`;
+
+  return <div className="flex flex-col gap-6">
+    <header><h1 className="font-heading text-3xl text-brand">{isAuthority ? "Authority Recommendations" : isRestrictedGrant ? "My Submissions" : "Team Submissions"}</h1><p className="mt-1 text-sm text-gray-600">{subtitle}</p></header>
+    {grants.length > 1 ? <nav aria-label="Dashboard role" className="flex flex-wrap gap-2 rounded-lg bg-gray-100 p-1.5">
+      {grants.map((grant) => <Link key={grant.role} href={`/authority?role=${grant.role}`} className={`rounded-md px-3 py-2 text-sm font-medium ${grant.role === activeGrant.role ? "bg-white text-brand shadow-sm" : "text-gray-600 hover:text-brand"}`}>{roleLabel(grant)}</Link>)}
+    </nav> : null}
+    <nav className="flex flex-wrap items-center gap-2 border-b border-gray-200 pb-0">
+      {isAuthority ? <>
+        <Tab href={`/authority?role=AUTHORITY${isDg ? "&view=pending" : ""}`} active={view === "pending"}>Pending My Recommendation</Tab>
+        <Tab href="/authority?role=AUTHORITY&view=history" active={view === "history"}>History</Tab>
+        <Tab href="/authority?role=AUTHORITY&view=my-submissions" active={view === "my-submissions"}>My Submissions</Tab>
+      </> : isRestrictedGrant ? (
+        // No Team Submissions tab - SELF/CASH_RECEIPT have no broader team
+        // to show, only their own submissions and their own Cash Receipts.
+        <>
+          <Tab href={`/authority?role=${activeGrant.role}`} active>My Submissions</Tab>
+          {canSeeCashReceiptsTab ? <Tab href={`/authority?role=${activeGrant.role}&view=cash-receipts`} active={false}>My Cash Receipts</Tab> : null}
+        </>
+      ) : <>
+        <Tab href={`/authority?role=${activeGrant.role}`} active={view === "team-submissions"}>Team Submissions</Tab>
+        <Tab href={`/authority?role=${activeGrant.role}&view=my-submissions`} active={view === "my-submissions"}>My Submissions</Tab>
+        {isBranchGrant && isModuleEnabled("cashReceipt") ? <Tab href={`/authority?role=${activeGrant.role}&view=cash-receipts`} active={false}>Cash Receipts</Tab> : null}
+      </>}
+      <div className="ml-auto mb-1.5"><StageLegend /></div>
+    </nav>
+    {filtersEnabled && (scopeTotal > 0 || hasActiveFilters(filters)) ? <DashboardFilters base={filterBase} filters={filters} counts={counts} showDecision={showDecision} /> : null}
+    {rows.length === 0 && hasActiveFilters(filters) ? <FilteredEmptyState base={filterBase} filters={filters} /> : rows.length === 0 ? <div className="rounded-lg border border-gray-200 p-10 text-center text-sm text-gray-500">
+      {isAuthority && view === "history" ? "No decisions recorded yet." : view === "my-submissions" ? "No submissions found for your login email." : isAuthority ? "Nothing is waiting for your recommendation." : "No submissions found for this team scope."}
+    </div> : <div className="dashboard-scroll-frame overflow-x-auto rounded-lg border border-gray-200"><table className={`w-full text-left text-sm ${showDownloads ? "dashboard-compact-table" : ""}`}>
+      <thead className="bg-gray-50/80 text-xs uppercase text-gray-500"><tr><th className="p-3">Reference</th><th className="p-3">Payee / Particulars</th><th className="p-3">Amount</th><th className="p-3">Submitted</th><th className="p-3">{isAuthority && view === "history" ? "Decision" : isAuthority && view === "pending" ? "Action" : "Current Stage"}</th>{showDownloads ? <th className="p-3">Download</th> : null}{isAuthority && view === "history" ? <><th className="p-3">Current Stage</th><th className="p-3">Action</th></> : null}</tr></thead>
+      <tbody className="divide-y divide-gray-100">{rows.map((row) => <tr key={row.id} className="align-top">
+        <td className="p-3 font-medium text-brand">{showDownloads ? withSlashBreaks(displayNoFor(row.paymentMode as PaymentMode, row.serialNo, row.cashVoucherNo, row.isAdvance, row.advanceNo)) : displayNoFor(row.paymentMode as PaymentMode, row.serialNo, row.cashVoucherNo, row.isAdvance, row.advanceNo)}</td>
+        <td className={`p-3 ${showDownloads ? "max-w-[10rem] xl:max-w-[14rem]" : ""}`}><div className={`font-medium ${showDownloads ? "truncate" : ""}`} title={row.payeeName}>{row.payeeName}</div><div className={`mt-1 max-w-xs text-xs text-gray-600 ${showDownloads ? "line-clamp-2" : ""}`} title={row.nature}>{row.nature}</div>{isAuthority && view === "pending" && row.revisionCount >= 1 ? <div className="mt-2 max-w-sm rounded border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-900"><strong>Resubmission - revision {row.revisionCount}</strong>{row.adminRemarks ? <div className="mt-1">Previous remarks: {row.adminRemarks}</div> : null}</div> : null}</td>
+        <td className="p-3 whitespace-nowrap">₹ {Number(row.amount).toLocaleString("en-IN", { minimumFractionDigits: 2 })}</td>
+        <td className="p-3 whitespace-nowrap">{view !== "my-submissions" ? <div className={showDownloads ? "max-w-[5.5rem] truncate" : ""} title={row.submittedBy}>{row.submittedBy}</div> : null}<div className="text-xs text-gray-500">{date(row.submittedAt)}</div></td>
+        <td className="p-3">{isAuthority && view === "pending" ? <div className="flex flex-col items-start gap-2"><StageBadge stage="Waiting on Authority" /><StageAgingIndicator advice={row} /><ViewLink adviceId={row.id} from="pending" /></div> : isAuthority && view === "history" ? <div className="text-xs"><StageBadge stage={row.status === "REJECTED" ? "Rejected" : row.approvedAt ? "Awaiting Finance Review" : "Sent Back"} /><div className="mt-1 text-gray-500">{date(row.finalRejectedAt ?? row.approvedAt ?? row.rejectedAt!)}</div>{(row.finalRejectionRemarks ?? row.authorityRemarks) ? <div className="mt-1 max-w-xs text-gray-600">{row.finalRejectionRemarks ?? row.authorityRemarks}</div> : null}</div> : <div className="text-xs"><StageBadge stage={pipelineStageFor(row)} /><div><StageAgingIndicator advice={row} /></div>{row.adminRemarks ? <div className="mt-2 max-w-xs rounded bg-amber-50 px-2 py-1 text-amber-800">Sent-back remarks: {row.adminRemarks}</div> : null}{view === "my-submissions" ? <div className="mt-2"><SubmitterEditAction status={row.status} editToken={row.editToken} editTokenExpiresAt={row.editTokenExpiresAt} /></div> : null}</div>}</td>
+        {showDownloads ? <td className="p-3"><SubmissionDownloadButtons adviceId={row.id} attachments={attachmentsByAdvice.get(row.id) ?? []} pdfHref={submissionPdfHref(row)} pdfLabel={submissionPdfLabel(row)} /></td> : null}
+        {isAuthority && view === "history" ? <>
+          {/* Where the submission is now, named and colored exactly like the stage filter above. */}
+          <td className="p-3"><StageBadge stage={pipelineStageFor(row)} label={stageFilterLabel(pipelineStageFor(row))} /></td>
+          <td className="p-3"><ViewLink adviceId={row.id} from="history" /></td>
+        </> : null}
+      </tr>)}</tbody>
+    </table></div>}
+  </div>;
+}
+
+/** "CASH/PD/2026-27/0049" with a line-break opportunity after each "/",
+ * so the Reference column can wrap at the slashes instead of holding the
+ * whole "CASH/PD/2026-" chunk on one line and crowding the Download
+ * column. Text and copy-paste are unchanged (<wbr> adds no characters). */
+function withSlashBreaks(reference: string) {
+  return reference.split("/").map((part, index, parts) => <span key={index}>{part}{index < parts.length - 1 ? <>/<wbr /></> : null}</span>);
+}
+
+function formatAmount(value: string): string {
+  return `₹ ${Number(value).toLocaleString("en-IN", { minimumFractionDigits: 2 })}`;
+}
+
+/** The Cash Receipts tab - only the receipts this specific person issued,
+ * never a colleague's even in the same branch, enforced here by the query
+ * itself (issuedByUserId = session.adminUserId), the same restriction the
+ * View/Download routes enforce server-side - this is not a UI-only filter
+ * layered on top of a broader query. Reached from a BRANCH grant (full Team
+ * Dashboard, unchanged) or a CASH_RECEIPT/SELF grant (restricted - no Team
+ * Submissions tab here either, same as the My Submissions view). */
+async function loadCashReceiptsTab(
+  activeGrant: DashboardGrant,
+  grants: DashboardGrant[],
+  adminUserId: string,
+  isRestrictedGrant: boolean,
+  params: { dateFrom?: string; dateTo?: string },
+) {
+  // Same range parsing as the report download (/api/cash-receipt/report),
+  // so the table always lists exactly the receipts the button downloads.
+  // Both dates default to today (IST); a malformed range falls back to today.
+  const today = todayInIst();
+  const parsedRange = parseReportRange(new URLSearchParams(Object.entries(params).filter((entry): entry is [string, string] => typeof entry[1] === "string")), today);
+  const range = parsedRange.ok ? parsedRange : { from: today, to: today };
+  const rows = await db
+    .select()
+    .from(cashReceipts)
+    .where(and(
+      eq(cashReceipts.issuedByUserId, adminUserId),
+      gte(cashReceipts.receiptDate, range.from),
+      lte(cashReceipts.receiptDate, range.to),
+    ))
+    .orderBy(desc(cashReceipts.createdAt));
+  const rangeLabel = range.from === range.to ? `on ${formatDateOnly(range.from)}` : `from ${formatDateOnly(range.from)} to ${formatDateOnly(range.to)}`;
+  const rangeTotal = rows.reduce((sum, row) => sum + Math.round(Number(row.total) * 100), 0) / 100;
+
+  return <div className="flex flex-col gap-6">
+    <header><h1 className="font-heading text-3xl text-brand">Cash Receipts</h1><p className="mt-1 text-sm text-gray-600">{rows.length} receipt{rows.length === 1 ? "" : "s"} you issued {rangeLabel}{rows.length ? `, total ${formatAmount(rangeTotal.toFixed(2))}` : ""}.</p></header>
+    {grants.length > 1 ? <nav aria-label="Dashboard role" className="flex flex-wrap gap-2 rounded-lg bg-gray-100 p-1.5">
+      {grants.map((grant) => <Link key={grant.role} href={`/authority?role=${grant.role}`} className={`rounded-md px-3 py-2 text-sm font-medium ${grant.role === activeGrant.role ? "bg-white text-brand shadow-sm" : "text-gray-600 hover:text-brand"}`}>{roleLabel(grant)}</Link>)}
+    </nav> : null}
+    <nav className="flex flex-wrap items-center gap-2 border-b border-gray-200 pb-0">
+      {isRestrictedGrant ? null : <Tab href={`/authority?role=${activeGrant.role}`} active={false}>Team Submissions</Tab>}
+      <Tab href={`/authority?role=${activeGrant.role}&view=my-submissions`} active={false}>My Submissions</Tab>
+      <Tab href={`/authority?role=${activeGrant.role}&view=cash-receipts`} active>{isRestrictedGrant ? "My Cash Receipts" : "Cash Receipts"}</Tab>
+    </nav>
+    <CashReceiptReportBar
+      key={`${range.from}:${range.to}`}
+      today={today}
+      yesterday={addCalendarDays(today, -1)}
+      from={range.from}
+      to={range.to}
+      filterBasePath="/authority"
+      filterParams={{ role: activeGrant.role, view: "cash-receipts" }}
+    />
+    {rows.length === 0 ? <div className="rounded-lg border border-gray-200 p-10 text-center text-sm text-gray-500">
+      You have no Cash Receipts {rangeLabel}.
+    </div> : <div className="overflow-x-auto rounded-lg border border-gray-200"><table className="w-full text-left text-sm">
+      <thead className="bg-gray-50 text-xs uppercase text-gray-500"><tr><th className="p-3">Reference</th><th className="p-3">Party Name</th><th className="p-3">Amount</th><th className="p-3">Receipt Date</th><th className="p-3">Status</th><th className="p-3">Documents</th></tr></thead>
+      <tbody className="divide-y divide-gray-100">{rows.map((row) => <tr key={row.id} className="align-top">
+        <td className="p-3 font-medium text-brand">{row.serialNo}</td>
+        <td className="p-3">{row.partyName}</td>
+        <td className="p-3 whitespace-nowrap">{formatAmount(row.total)}</td>
+        <td className="p-3 whitespace-nowrap">{formatDateOnly(row.receiptDate)}</td>
+        {/* Read only: the issuer sees whether Finance has received the cash. */}
+        <td className="p-3">{row.receivedAt ? <span className="block max-w-[12rem] rounded-md bg-green-50 px-2 py-1 text-xs font-medium text-green-800">{cashReceiptStatusText(row)}</span> : <span className="inline-flex rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">{cashReceiptStatusText(row)}</span>}{row.receivedNote ? <div className="mt-1 max-w-[14rem] text-xs text-gray-600">Note: {row.receivedNote}</div> : null}</td>
+        <td className="p-3"><div className="flex items-center gap-2">
+          <a href={`/cash-receipt/${row.id}`} target="_blank" rel="noreferrer" className="rounded-md border border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50">View</a>
+          <a href={`/api/cash-receipt/${row.id}/pdf`} className="rounded-md border border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50">Download</a>
+        </div></td>
+      </tr>)}</tbody>
+    </table></div>}
+  </div>;
+}
+
+async function loadDgExecutiveDashboard() {
+  const [stageRows, adviceRows, entryRows] = await Promise.all([
+    Promise.all(PIPELINE_SUMMARY_STAGES.map(async ({ tab }) => {
+      const [result] = await db.select({ count: count(), sum: sum(paymentAdvices.amount) })
+        .from(paymentAdvices).where(buildTabCondition(tab));
+      return { tab, count: result?.count ?? 0, sum: Number(result?.sum ?? 0) };
+    })),
+    db.select({
+      id: paymentAdvices.id,
+      serialNo: paymentAdvices.serialNo,
+      cashVoucherNo: paymentAdvices.cashVoucherNo,
+      advanceNo: paymentAdvices.advanceNo,
+      isAdvance: paymentAdvices.isAdvance,
+      paymentMode: paymentAdvices.paymentMode,
+      status: paymentAdvices.status,
+      submittedAt: paymentAdvices.submittedAt,
+      authorityApprovedAt: paymentAdvices.authorityApprovedAt,
+      financeReceivedAt: paymentAdvices.financeReceivedAt,
+      paymentDoneAt: paymentAdvices.paymentDoneAt,
+    }).from(paymentAdvices),
+    db.select({ adviceId: paymentEntries.paymentAdviceId, paidAt: paymentEntries.paidAt }).from(paymentEntries),
+  ]);
+
+  const summaryRows = buildDgSummaryMetrics(stageRows);
+
+  const firstPaymentByAdvice = new Map<string, Date>();
+  for (const entry of entryRows) {
+    const existing = firstPaymentByAdvice.get(entry.adviceId);
+    if (!existing || entry.paidAt < existing) firstPaymentByAdvice.set(entry.adviceId, entry.paidAt);
+  }
+  const intervalRows = adviceRows.map((row) => ({
+    id: row.id,
+    reference: displayNoFor(row.paymentMode as PaymentMode, row.serialNo, row.cashVoucherNo, row.isAdvance, row.advanceNo),
+    status: row.status,
+    submittedAt: row.submittedAt,
+    authorityApprovedAt: row.authorityApprovedAt,
+    financeReceivedAt: row.financeReceivedAt,
+    paymentDoneAt: row.paymentDoneAt,
+    firstPaymentAt: firstPaymentByAdvice.get(row.id) ?? null,
+  }));
+  return <DgExecutiveDashboard metrics={summaryRows} intervals={calculateDgIntervalMetrics(intervalRows)} />;
+}
+
+function ViewLink({ adviceId, from }: { adviceId: string; from: "pending" | "history" }) {
+  return <Link href={`/authority/advice/${adviceId}?from=${from}`} className="inline-flex rounded-md bg-brand px-3 py-2 text-xs font-medium text-white hover:bg-brand/90">View</Link>;
+}
+function Tab({ href, active, children }: { href: string; active: boolean; children: React.ReactNode }) {
+  return <Link href={href} className={`px-4 py-2 text-sm font-medium ${active ? "border-b-2 border-brand text-brand" : "text-gray-500"}`}>{children}</Link>;
+}
