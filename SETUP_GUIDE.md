@@ -14,7 +14,7 @@ The client creates and owns all of these (we are invited as collaborators and re
 | Vercel | Hosting | Connect the repo; Hobby/Pro per the client's needs |
 | Neon | Postgres database | The app needs a real Neon endpoint (WebSocket driver, real transactions) |
 | Vercel Blob | Attachment storage | A **Private** store in the same Vercel project |
-| Google AI Studio (optional) | Invoice auto-fill (`GEMINI_API_KEY`) | If skipped, auto-fill is off and forms work manually |
+| Google AI Studio (optional) | Invoice auto-fill (a free Gemini API key) | If skipped, auto-fill is off and forms work manually. The client adds the key themselves in the app: Admin > AI Auto-fill |
 | Gmail or Resend (optional) | Sending real emails | If skipped, emails are only logged (`EMAIL_MODE=preview`) |
 
 ## 1. Create the repository
@@ -50,7 +50,7 @@ Vercel: Project -> Settings -> Environment Variables (set for **Production and P
 | `GMAIL_USER`, `GMAIL_APP_PASSWORD` | if gmail | Sending account and a 16-char App Password |
 | `RESEND_API_KEY`, `EMAIL_FROM` | if resend | API key; sender on a domain verified in Resend |
 | `EMAIL_TEST_OVERRIDE_RECIPIENT` | no | While testing live email: redirect all mail to this address |
-| `GEMINI_API_KEY` | no | Enables invoice auto-fill |
+| `GEMINI_API_KEY` | no | Optional. Normally leave unset and add the key in the app (Admin > AI Auto-fill, full-access Finance login); that saved key takes priority |
 
 If a required variable is missing or malformed, every page and API answers `503` with a message naming it (and the log shows it at startup).
 Never set `TEST_DATABASE_URL` to a real database (the serial-number tests write to it).
@@ -147,7 +147,7 @@ Deploy to a Vercel **Preview** first when possible.
 | Login fails after `db:seed` | Passwords are shown once; delete the user row or re-seed a fresh database |
 | Uploads fail | `BLOB_READ_WRITE_TOKEN` missing, or the store is not Private |
 | Vendor/staff dropdowns empty | No staff, authorities or vendors yet (step 7) |
-| Auto-fill says "not available" | `GEMINI_API_KEY` not set (forms still work manually) |
+| Auto-fill says "not available" | No Gemini key yet: add one under Admin > AI Auto-fill (or set `GEMINI_API_KEY`). Forms still work manually. A saved key becomes unreadable if `AUTH_SECRET` changes: paste it again |
 | A module is "404" | It is switched off in `config/org.config.ts` |
 
 ## Known limitations (inherited from the original app, not changed in the template)

@@ -13,6 +13,7 @@ import {
 import { MAX_FILE_SIZE_BYTES } from "@/lib/validation/payment-advice";
 import { PENDING_UPLOAD_PREFIX } from "@/lib/attachments/client-upload";
 import { clientIpFrom, createRateLimiter } from "@/lib/rate-limit";
+import { GEMINI_MODEL, getGeminiApiKey } from "@/lib/gemini-key";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
@@ -106,9 +107,9 @@ export async function POST(request: Request) {
     return NextResponse.json({ autoFill: null, error: "The uploaded invoice reference is invalid. Attach the file again." }, { status: 400 });
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = await getGeminiApiKey();
   if (!apiKey) {
-    console.warn("Gemini invoice auto-fill requested without GEMINI_API_KEY configured");
+    console.warn("Gemini invoice auto-fill requested without a Gemini API key configured");
     return NextResponse.json({ autoFill: null, error: "Invoice auto-fill is not available right now. Please fill the form manually." }, { status: 503 });
   }
 
@@ -148,7 +149,7 @@ export async function POST(request: Request) {
 
     const ai = new GoogleGenAI({ apiKey });
     const result = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: GEMINI_MODEL,
       contents: [
         { text: extractionPrompt },
         { inlineData: { mimeType, data: base64 } },

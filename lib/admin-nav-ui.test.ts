@@ -69,6 +69,6 @@ describe("Finance Admin top nav, restructured (2026-10-07)", () => {
   });
 
   it("keeps + New Submission and the account menu visually separated from the main links", () => {
-    expect(nav).toContain("border-l border-white/20 pl-6");
+    expect(nav).toContain("border-l border-white/20");
   });
 });

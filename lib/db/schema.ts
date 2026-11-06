@@ -720,3 +720,13 @@ export const auditLog = pgTable("audit_log", {
     .defaultNow()
     .notNull(),
 });
+
+/** Small key/value store for settings an admin can change from the UI (so no
+ * redeploy is needed). Secret values (the Gemini API key) are stored
+ * encrypted - see lib/secret-box.ts - never as plain text. */
+export const appSettings = pgTable("app_settings", {
+  key: text("key").primaryKey(),
+  value: text("value").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedBy: text("updated_by"),
+});

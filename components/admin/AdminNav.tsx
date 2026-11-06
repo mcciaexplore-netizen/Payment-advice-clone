@@ -52,6 +52,12 @@ const STAFF_ITEM: NavItem = {
   match: (p) => p.startsWith("/admin/staff"),
 };
 
+const AI_ITEM: NavItem = {
+  href: "/admin/ai-autofill",
+  label: "AI Auto-fill",
+  match: (p) => p.startsWith("/admin/ai-autofill"),
+};
+
 function navLinkClass(active: boolean): string {
   return `whitespace-nowrap border-b-2 py-0.5 text-sm font-medium transition-colors ${
     active
@@ -65,11 +71,14 @@ export function AdminNav({
   changePasswordHref,
   authorityHref,
   pendingVendorRequestCount,
+  showAiAutofill = false,
 }: {
   roleLabel: string;
   changePasswordHref: string;
   authorityHref: string | null;
   pendingVendorRequestCount: number;
+  /** Full-access Finance logins only (the page and API re-check this). */
+  showAiAutofill?: boolean;
 }) {
   const pathname = usePathname();
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -78,7 +87,7 @@ export function AdminNav({
 
   return (
     <>
-      <nav className="hidden items-center gap-x-6 gap-y-2 text-sm text-white/80 xl:flex">
+      <nav className={`hidden items-center gap-y-2 text-sm text-white/80 xl:flex ${showAiAutofill ? "gap-x-5" : "gap-x-6"}`}>
         {NAV_ITEMS.map((item) => (
           <Link key={item.href} href={item.href} className={navLinkClass(item.match(pathname))}>
             {item.label}
@@ -88,7 +97,12 @@ export function AdminNav({
         <Link href={STAFF_ITEM.href} className={navLinkClass(STAFF_ITEM.match(pathname))}>
           {STAFF_ITEM.label}
         </Link>
-        <div className="flex items-center gap-5 whitespace-nowrap border-l border-white/20 pl-6">
+        {showAiAutofill ? (
+          <Link href={AI_ITEM.href} className={navLinkClass(AI_ITEM.match(pathname))}>
+            {AI_ITEM.label}
+          </Link>
+        ) : null}
+        <div className={`flex items-center gap-5 whitespace-nowrap border-l border-white/20 ${showAiAutofill ? "pl-5" : "pl-6"}`}>
           <NewSubmissionLink />
           <AccountMenu label={roleLabel} changePasswordHref={changePasswordHref} extraLinks={extraLinks} />
         </div>
@@ -138,6 +152,11 @@ export function AdminNav({
             <DrawerLink href={STAFF_ITEM.href} active={STAFF_ITEM.match(pathname)} onNavigate={() => setDrawerOpen(false)}>
               {STAFF_ITEM.label}
             </DrawerLink>
+            {showAiAutofill ? (
+              <DrawerLink href={AI_ITEM.href} active={AI_ITEM.match(pathname)} onNavigate={() => setDrawerOpen(false)}>
+                {AI_ITEM.label}
+              </DrawerLink>
+            ) : null}
             {authorityHref ? (
               <DrawerLink href={authorityHref} active={pathname.startsWith(authorityHref)} onNavigate={() => setDrawerOpen(false)}>
                 My Recommendations

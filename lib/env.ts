@@ -55,7 +55,7 @@ export function checkEnv(env: Env = process.env): EnvReport {
   }
 
   if (!present(env.GEMINI_API_KEY)) {
-    warnings.push("GEMINI_API_KEY is not set: invoice auto-fill is disabled (forms still work manually).");
+    warnings.push("GEMINI_API_KEY is not set: invoice auto-fill is off until a key is added under Admin > AI Auto-fill (forms still work manually).");
   }
 
   return { errors, warnings };

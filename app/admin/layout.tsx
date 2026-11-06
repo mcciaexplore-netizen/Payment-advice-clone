@@ -6,6 +6,7 @@ import { getAdminSession } from "@/lib/admin-session";
 import { hasRole } from "@/lib/auth";
 import { getPendingVendorRequestCount } from "@/lib/advice/vendor-requests";
 import { APP_NAME } from "@/lib/branding";
+import { isModuleEnabled } from "@/lib/config";
 import { LOGO_PATH } from "@/lib/branding";
 
 const ROLE_LABELS: Record<string, string> = {
@@ -57,6 +58,7 @@ export default async function AdminLayout({ children }: { children: React.ReactN
               changePasswordHref="/admin/change-password"
               authorityHref={hasRole(session, "AUTHORITY") ? "/authority" : null}
               pendingVendorRequestCount={pendingVendorRequestCount}
+              showAiAutofill={hasRole(session, "ALL") && isModuleEnabled("paymentAdvice")}
             />
           ) : null}
         </div>

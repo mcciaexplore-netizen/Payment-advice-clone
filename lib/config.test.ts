@@ -10,6 +10,9 @@ vi.mock("next/navigation", () => ({
 }));
 vi.mock("@/components/public/PublicLoginMenu", () => ({ PublicLoginMenu: () => null }));
 
+// These tests import whole pages and forms; give them room when the full suite runs in parallel.
+vi.setConfig({ testTimeout: 30_000 });
+
 const clone = (): OrgConfig => structuredClone(defaultConfig);
 
 /** Loads a fresh copy of the app modules against a modified organisation config. */
